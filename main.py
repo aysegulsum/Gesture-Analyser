@@ -285,6 +285,19 @@ def draw_simon_hud(frame, gm: GameManager, hands):
         y_off += 28
 
 
+def _draw_air_canvas(frame, path, w, h):
+    """Draw the air-drawing trajectory as a persistent line on the frame."""
+    if len(path) < 2:
+        return
+    for i in range(1, len(path)):
+        x1, y1 = int(path[i-1][0] * w), int(path[i-1][1] * h)
+        x2, y2 = int(path[i][0] * w), int(path[i][1] * h)
+        cv2.line(frame, (x1, y1), (x2, y2), MAGENTA, 3)
+    # Draw a dot at the current tip position.
+    lx, ly = int(path[-1][0] * w), int(path[-1][1] * h)
+    cv2.circle(frame, (lx, ly), 7, WHITE, -1)
+
+
 def draw_liveness_hud(frame, gm: GameManager, hands):
     lv = gm.liveness
     h, w = frame.shape[:2]
@@ -295,12 +308,19 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
         cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 200), -1)
         cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
 
-    draw_countdown_ring(frame, lv.time_remaining, lv.time_limit, w - 90, 90, radius=55)
+    # Air-drawing canvas (behind all text).
+    if lv.is_drawing_cmd and ls == LivenessState.ACTIVE:
+        _draw_air_canvas(frame, lv.drawing_path, w, h)
+
+    draw_countdown_ring(frame, lv.time_remaining, lv._effective_time_limit, w - 90, 90, radius=55)
     put_text_with_bg(frame, f"Score: {lv.score}", (20, 40), font_scale=0.8, color=GREEN, thickness=2)
     if lv.streak > 1:
         put_text_with_bg(frame, f"Streak: {lv.streak}", (20, 75), font_scale=0.65, color=ORANGE)
 
     if ls == LivenessState.SUCCESS:
+        # Keep showing the finished drawing briefly on success.
+        if lv.is_drawing_cmd:
+            _draw_air_canvas(frame, lv.drawing_path, w, h)
         put_text_centered(frame, "VERIFIED!", h // 2 - 20, font_scale=1.4, color=GREEN, thickness=3)
     elif ls == LivenessState.FAILED:
         put_text_centered(frame, "FAILED!", h // 2 - 20, font_scale=1.4, color=RED, thickness=3)
@@ -312,10 +332,25 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
             draw_progress_bar(frame, lv.debounce_progress, y=h // 2 + 10, color_full=GREEN, color_fill=ORANGE)
             put_text_centered(frame, "Confirming...", h // 2 + 50, font_scale=0.7, color=ORANGE)
 
+        # Wave progress counter.
+        if lv.is_wave_cmd:
+            rev = lv.wave_reversals
+            rev_color = GREEN if rev >= 2 else YELLOW if rev >= 1 else WHITE
+            put_text_with_bg(frame, f"Waves: {rev}/2", (20, h - 125), font_scale=0.65, color=rev_color)
+
+        # Drawing hint + point count.
+        if lv.is_drawing_cmd:
+            pts = lv.drawing_point_count
+            if pts > 0:
+                hint = f"Drawing... ({pts} pts) - close fist to finish"
+            else:
+                hint = "Extend index finger and draw in the air"
+            put_text_with_bg(frame, hint, (20, h - 125), font_scale=0.55, color=MAGENTA)
+
     status_color = GREEN if ls == LivenessState.SUCCESS else RED if ls == LivenessState.FAILED else YELLOW
     put_text_with_bg(frame, lv.status_label, (20, h - 90), font_scale=0.7, color=status_color)
 
-    # Depth meter for spatial commands
+    # Depth meter for spatial commands.
     if lv.current_cmd and lv.current_cmd.cmd_type in (CmdType.MOVE_CLOSER, CmdType.MOVE_AWAY):
         pct = lv.area_change_pct
         if pct is not None:

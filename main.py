@@ -21,6 +21,8 @@ GameManager   -- owns all game sessions, handles mode switching and the
 main loop     -- capture + render only; no game logic here.
 """
 
+import time
+
 import cv2
 import numpy as np
 
@@ -29,6 +31,7 @@ from gesture_session import GestureSession, SessionState
 from math_session import MathSession, MathState
 from simon_session import SimonSaysGame, SimonState
 from liveness_session import LivenessChallenge, LivenessState, CmdType
+from sequential_session import SequentialSession, SeqState, StepResult
 
 
 # -- colour palette -------------------------------------------------------
@@ -41,7 +44,7 @@ MAGENTA = (200, 50, 255)
 ORANGE = (0, 160, 255)
 DARK_BG = (40, 40, 40)
 
-MODE_NAMES = ["Normal", "Math", "Simon", "Liveness"]
+MODE_NAMES = ["Normal", "Math", "Simon", "Liveness", "Sequential"]
 
 
 # ── GameManager ─────────────────────────────────────────────────────
@@ -73,6 +76,10 @@ class GameManager:
             area_change_threshold=0.20, pause_after_result=1.5,
             smoothing_window=7,
         )
+        self.sequential = SequentialSession(
+            hold_seconds=1.0, pause_after_step=1.0,
+            depth_threshold=0.20, smoothing_window=7,
+        )
 
         self.hands_present = False
 
@@ -82,23 +89,26 @@ class GameManager:
 
     def cycle_mode(self):
         self.current_mode = (self.current_mode + 1) % len(self.modes)
-        # Reset the newly-selected mode.
         if self.current_mode == 1:
             self.math.reset()
         elif self.current_mode == 2:
             self.simon.reset()
         elif self.current_mode == 3:
             self.liveness.reset()
+        elif self.current_mode == 4:
+            self.sequential.reset()
 
     def restart(self):
         if self.current_mode == 0:
-            pass  # Normal auto-cycles
+            pass
         elif self.current_mode == 1:
             self.math.reset()
         elif self.current_mode == 2:
             self.simon.next_round()
         elif self.current_mode == 3:
             self.liveness.reset()
+        elif self.current_mode == 4:
+            self.sequential.reset()
 
     def update(self, hands: list[HandResult]):
         """Global hand-presence check, then delegate to active mode.
@@ -117,8 +127,10 @@ class GameManager:
             self.math.update(hands)
         elif self.current_mode == 2:
             self.simon.update(hands)
-        else:
+        elif self.current_mode == 3:
             self.liveness.update(hands)
+        elif self.current_mode == 4:
+            self.sequential.update(hands)
 
 
 # ── Drawing utilities ───────────────────────────────────────────────
@@ -298,6 +310,25 @@ def _draw_air_canvas(frame, path, w, h):
     cv2.circle(frame, (lx, ly), 7, WHITE, -1)
 
 
+def _draw_verification_bar(frame, pct, y=55):
+    """Draw a wide verification score bar (0-100%)."""
+    h, w = frame.shape[:2]
+    bar_w = int(w * 0.5)
+    x_start = (w - bar_w) // 2
+    # Background
+    cv2.rectangle(frame, (x_start, y), (x_start + bar_w, y + 22), DARK_BG, -1)
+    # Fill
+    fill_w = int(bar_w * pct / 100.0)
+    bar_color = GREEN if pct >= 100 else CYAN if pct >= 60 else YELLOW if pct >= 20 else RED
+    cv2.rectangle(frame, (x_start, y), (x_start + fill_w, y + 22), bar_color, -1)
+    cv2.rectangle(frame, (x_start, y), (x_start + bar_w, y + 22), WHITE, 1)
+    # Label
+    label = f"Verification: {pct:.0f}%"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(label, font, 0.55, 1)
+    cv2.putText(frame, label, (x_start + (bar_w - tw) // 2, y + 17), font, 0.55, WHITE, 1)
+
+
 def draw_liveness_hud(frame, gm: GameManager, hands):
     lv = gm.liveness
     h, w = frame.shape[:2]
@@ -312,13 +343,28 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
     if lv.is_drawing_cmd and ls == LivenessState.ACTIVE:
         _draw_air_canvas(frame, lv.drawing_path, w, h)
 
-    draw_countdown_ring(frame, lv.time_remaining, lv._effective_time_limit, w - 90, 90, radius=55)
-    put_text_with_bg(frame, f"Score: {lv.score}", (20, 40), font_scale=0.8, color=GREEN, thickness=2)
-    if lv.streak > 1:
-        put_text_with_bg(frame, f"Streak: {lv.streak}", (20, 75), font_scale=0.65, color=ORANGE)
+    # -- Verification score bar (top) -------------------------------------
+    _draw_verification_bar(frame, lv.verification_pct, y=10)
+
+    # Challenge progress + score
+    put_text_with_bg(frame, lv.challenge_progress_text, (20, 55), font_scale=0.6, color=CYAN)
+    put_text_with_bg(frame, f"Score: {lv.score}", (20, 85), font_scale=0.7, color=GREEN, thickness=2)
+
+    # Countdown ring
+    if ls not in (LivenessState.VERIFIED_100,):
+        draw_countdown_ring(frame, lv.time_remaining, lv._effective_time_limit, w - 90, 90, radius=55)
+
+    spoof = lv.spoof_result
+
+    # -- 100% verified state ----------------------------------------------
+    if ls == LivenessState.VERIFIED_100:
+        put_text_centered(frame, "ACCESS GRANTED", h // 2 - 30, font_scale=1.4, color=GREEN, thickness=3)
+        put_text_centered(frame, "100% Verification Complete", h // 2 + 20, font_scale=0.8, color=WHITE)
+        put_text_centered(frame, "Liveness confirmed", h // 2 + 60, font_scale=0.6, color=GREEN)
+        put_text_centered(frame, "Press R to restart", h // 2 + 100, font_scale=0.7, color=YELLOW)
+        return
 
     if ls == LivenessState.SUCCESS:
-        # Keep showing the finished drawing briefly on success.
         if lv.is_drawing_cmd:
             _draw_air_canvas(frame, lv.drawing_path, w, h)
         put_text_centered(frame, "VERIFIED!", h // 2 - 20, font_scale=1.4, color=GREEN, thickness=3)
@@ -338,13 +384,10 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
             rev_color = GREEN if rev >= 2 else YELLOW if rev >= 1 else WHITE
             put_text_with_bg(frame, f"Waves: {rev}/2", (20, h - 125), font_scale=0.65, color=rev_color)
 
-        # Drawing hint + point count.
+        # Drawing hint.
         if lv.is_drawing_cmd:
             pts = lv.drawing_point_count
-            if pts > 0:
-                hint = f"Drawing... ({pts} pts) - close fist to finish"
-            else:
-                hint = "Extend index finger and draw in the air"
+            hint = f"Drawing... ({pts} pts) - close fist to finish" if pts > 0 else "Extend index finger and draw"
             put_text_with_bg(frame, hint, (20, h - 125), font_scale=0.55, color=MAGENTA)
 
     status_color = GREEN if ls == LivenessState.SUCCESS else RED if ls == LivenessState.FAILED else YELLOW
@@ -368,8 +411,6 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
             elif fill_px < 0:
                 cv2.rectangle(frame, (meter_x - 12, meter_mid), (meter_x + 12, meter_mid - fill_px), fill_col, -1)
             put_text_with_bg(frame, f"{pct:+.0f}%", (meter_x - 25, meter_bot + 25), font_scale=0.55, color=fill_col)
-            sign = "+" if lv.current_cmd.cmd_type == CmdType.MOVE_CLOSER else "-"
-            put_text_with_bg(frame, f"Need: {sign}{int(lv.area_change_threshold * 100)}%", (meter_x - 35, meter_top - 10), font_scale=0.5, color=WHITE)
 
     per_hand = lv.per_hand_counts(hands)
     y_off = h - 55
@@ -379,7 +420,97 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
             y_off += 28
 
 
-_HUD_DRAWERS = [draw_normal_hud, draw_math_hud, draw_simon_hud, draw_liveness_hud]
+def draw_sequential_hud(frame, gm: GameManager, hands):
+    from sequential_session import StepResult
+    seq = gm.sequential
+    h, w = frame.shape[:2]
+    ss = seq.state
+
+    # Step boxes at the top (two rows if > 10 steps)
+    total = seq.total_steps
+    per_row = min(total, 10)
+    box_w, box_h, gap = 55, 24, 4
+    rows = (total + per_row - 1) // per_row
+
+    for row in range(rows):
+        start_i = row * per_row
+        end_i = min(start_i + per_row, total)
+        count = end_i - start_i
+        total_w = count * (box_w + gap) - gap
+        x_start = (w - total_w) // 2
+        y_box = 8 + row * (box_h + 4)
+
+        for i in range(start_i, end_i):
+            x = x_start + (i - start_i) * (box_w + gap)
+            result = seq.step_results[i]
+            if result == StepResult.PASSED:
+                bg_col = GREEN
+            elif result == StepResult.TIMED_OUT:
+                bg_col = RED
+            elif i == seq.current_step_idx:
+                bg_col = YELLOW if ss in (SeqState.ACTIVE, SeqState.HOLDING) else GREEN if ss == SeqState.STEP_DONE else RED
+            else:
+                bg_col = (50, 50, 50)
+            cv2.rectangle(frame, (x, y_box), (x + box_w, y_box + box_h), bg_col, -1)
+            cv2.rectangle(frame, (x, y_box), (x + box_w, y_box + box_h), WHITE, 1)
+            cv2.putText(frame, str(i + 1), (x + box_w // 2 - 5, y_box + box_h - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, WHITE, 1)
+
+    info_y = 8 + rows * (box_h + 4) + 10
+
+    # Progress + global timer
+    put_text_with_bg(frame, seq.progress_text, (20, info_y), font_scale=0.6, color=CYAN)
+    put_text_with_bg(frame, f"Passed: {seq.passed_count}/{seq.total_steps}", (180, info_y), font_scale=0.6, color=GREEN)
+    if seq.elapsed_time > 0:
+        put_text_with_bg(frame, f"Total: {seq.elapsed_time:.1f}s", (w - 180, info_y), font_scale=0.6, color=WHITE)
+
+    # Per-step countdown (top-right area)
+    if ss not in (SeqState.COMPLETE,):
+        remaining = seq.step_time_remaining
+        step = seq.current_step
+        limit = step.time_limit if step else 0
+        draw_countdown_ring(frame, remaining, limit, w - 70, info_y + 60, radius=40)
+
+    # Centre: current step instruction
+    if ss == SeqState.COMPLETE:
+        put_text_centered(frame, "ALL TASKS COMPLETE!", h // 2 - 30, font_scale=1.2, color=GREEN, thickness=3)
+        put_text_centered(frame, f"Passed: {seq.passed_count}/{seq.total_steps}  |  Time: {seq.elapsed_time:.1f}s", h // 2 + 15, font_scale=0.75, color=WHITE)
+        put_text_centered(frame, "Press R to restart", h // 2 + 55, font_scale=0.7, color=YELLOW)
+    elif ss == SeqState.STEP_TIMEOUT:
+        put_text_centered(frame, "TIME'S UP!", h // 2 - 20, font_scale=1.2, color=RED, thickness=2)
+        put_text_centered(frame, "Skipping to next...", h // 2 + 20, font_scale=0.7, color=YELLOW)
+    elif ss == SeqState.STEP_DONE:
+        put_text_centered(frame, "PASSED!", h // 2 - 20, font_scale=1.2, color=GREEN, thickness=2)
+        put_text_centered(frame, "Next step incoming...", h // 2 + 20, font_scale=0.7, color=WHITE)
+    else:
+        step_color = ORANGE if ss == SeqState.HOLDING else CYAN
+        put_text_centered(frame, seq.display_text, h // 2 - 20, font_scale=0.9, color=step_color, thickness=2)
+
+        if ss == SeqState.HOLDING:
+            draw_progress_bar(frame, seq.hold_progress, y=h // 2 + 15)
+
+        # Drawing canvas
+        step = seq.current_step
+        if step and step.step_type in ("draw_circle", "draw_square"):
+            _draw_air_canvas(frame, seq.drawing_path, w, h)
+            pts = len(seq.drawing_path)
+            if pts > 0:
+                put_text_with_bg(frame, f"Drawing... ({pts} pts)", (20, h - 125), font_scale=0.55, color=MAGENTA)
+
+    # Status
+    status_color = GREEN if ss in (SeqState.STEP_DONE, SeqState.COMPLETE) else RED if ss == SeqState.STEP_TIMEOUT else YELLOW if ss == SeqState.HOLDING else WHITE
+    put_text_with_bg(frame, seq.status_label, (20, h - 90), font_scale=0.7, color=status_color)
+
+    # Per-hand counts
+    per_hand = seq.per_hand_counts(hands)
+    y_off = h - 55
+    for label in ("Left", "Right"):
+        if label in per_hand:
+            put_text_with_bg(frame, f"{label}: {per_hand[label]}", (w - 180, y_off), font_scale=0.6)
+            y_off += 28
+
+
+_HUD_DRAWERS = [draw_normal_hud, draw_math_hud, draw_simon_hud, draw_liveness_hud, draw_sequential_hud]
 
 
 # ── Main loop ───────────────────────────────────────────────────────
@@ -398,7 +529,11 @@ def run():
     )
     gm = GameManager()
 
-    print("Gesture Validator v5 -- 'M' cycle modes, 'R' restart, 'Q' quit.")
+    print("Gesture Validator -- 'M' cycle modes, 'R' restart, 'Q' quit.")
+
+    # FPS counter state
+    _fps_prev_time = time.time()
+    _fps_value = 0.0
 
     with tracker:
         while True:
@@ -407,6 +542,13 @@ def run():
                 break
 
             frame = cv2.flip(frame, 1)
+
+            # -- FPS calculation ------------------------------------------
+            _now = time.time()
+            dt = _now - _fps_prev_time
+            if dt > 0:
+                _fps_value = 0.7 * (1.0 / dt) + 0.3 * _fps_value
+            _fps_prev_time = _now
 
             # -- Detection (separated from game logic) --------------------
             hands = tracker.process(frame)
@@ -423,9 +565,11 @@ def run():
                 draw_no_hand_overlay(frame)
             _HUD_DRAWERS[gm.current_mode](frame, gm, hands)
 
-            # Mode indicator (bottom-right)
+            # Mode indicator (bottom-right) + FPS counter (top-right corner)
             fh, fw = frame.shape[:2]
             put_text_with_bg(frame, f"[M] {gm.mode_name}", (fw - 220, fh - 20), font_scale=0.55, color=CYAN)
+            fps_color = GREEN if _fps_value >= 25 else YELLOW if _fps_value >= 15 else RED
+            put_text_with_bg(frame, f"FPS: {_fps_value:.0f}", (10, fh - 20), font_scale=0.5, color=fps_color)
 
             cv2.imshow("Gesture Validator", frame)
 

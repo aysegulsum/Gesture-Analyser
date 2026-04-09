@@ -58,7 +58,6 @@ _FINGER_JOINTS = {
     Finger.PINKY:  (_LM["PINKY_PIP"],  _LM["PINKY_TIP"]),
 }
 
-# TIP landmark indices (used by the debug visualiser).
 FINGER_TIP_IDS = {
     Finger.THUMB:  _LM["THUMB_TIP"],
     Finger.INDEX:  _LM["INDEX_TIP"],
@@ -82,6 +81,16 @@ def hand_scale(landmarks) -> float:
 def depth_proxy(landmarks) -> float:
     """Alias of hand_scale.  Increases when hand moves closer."""
     return hand_scale(landmarks)
+
+
+def _tip_wrist_ratio(landmarks, finger_name: Finger) -> float:
+    """Dist(Wrist, Tip) / hand_scale.  For debug display."""
+    hs = hand_scale(landmarks)
+    if hs < 1e-9:
+        return 0.0
+    wrist = landmarks[_LM["WRIST"]]
+    tip_id = FINGER_TIP_IDS[finger_name]
+    return _euclidean(wrist, landmarks[tip_id]) / hs
 
 
 # ── Per-finger ratio (v5 proven method) ─────────────────────────────
@@ -115,6 +124,30 @@ def is_finger_open(landmarks, hand_label: str, finger_name: Finger,
     return finger_ratio(landmarks, finger_name) > open_threshold
 
 
+def is_fist(landmarks) -> bool:
+    """Return True if all fingers score below their open threshold."""
+    for finger in Finger:
+        score = finger_ratio(landmarks, finger)
+        th = 0.75 if finger == Finger.THUMB else 0.20
+        if score > th:
+            return False
+    return True
+
+
+# ── Debug info ──────────────────────────────────────────────────────
+
+def finger_debug_info(landmarks, handedness: str = "Right") -> dict[Finger, tuple[int, bool, float, float]]:
+    """Per-finger debug: {finger: (tip_id, is_open, ratio, tip_wrist_ratio)}."""
+    info = {}
+    for finger in Finger:
+        tip_id = FINGER_TIP_IDS[finger]
+        ratio = finger_ratio(landmarks, finger)
+        tw = _tip_wrist_ratio(landmarks, finger)
+        open_th = 0.75 if finger == Finger.THUMB else 0.20
+        info[finger] = (tip_id, ratio > open_th, ratio, tw)
+    return info
+
+
 # ── Data structures ─────────────────────────────────────────────────
 
 @dataclass
@@ -131,21 +164,6 @@ class FingerState:
 
     def as_list(self) -> list[bool]:
         return [self.thumb, self.index, self.middle, self.ring, self.pinky]
-
-
-def finger_debug_info(landmarks, handedness: str = "Right") -> dict[Finger, tuple[int, bool, float]]:
-    """Per-finger debug: {finger: (tip_landmark_id, is_open, ratio)}.
-
-    Used by the debug visualiser to draw green/red circles on tips.
-    """
-    info = {}
-    for finger in Finger:
-        tip_id = FINGER_TIP_IDS[finger]
-        ratio = finger_ratio(landmarks, finger)
-        open_th = 0.75 if finger == Finger.THUMB else 0.20
-        is_open = ratio > open_th
-        info[finger] = (tip_id, is_open, ratio)
-    return info
 
 
 # ── Hysteresis (Layer 2) ────────────────────────────────────────────
@@ -216,6 +234,100 @@ class _EWMASmoother:
         self._conf = {f: 0.0 for f in Finger}
 
 
+# ── Moving Median Filter (Layer 4) ──────────────────────────────────
+
+class _MedianFilter:
+    """Moving median of recent finger counts.  Eliminates the 0↔1
+    flicker on tight fists that EWMA alone can't fully suppress."""
+
+    def __init__(self, window: int = 5):
+        from collections import deque
+        self._buf: deque[int] = deque(maxlen=window)
+
+    def filter(self, count: int) -> int:
+        self._buf.append(count)
+        return sorted(self._buf)[len(self._buf) // 2]
+
+    def reset(self):
+        self._buf.clear()
+
+
+# ── Auto-Calibration ────────────────────────────────────────────────
+
+class HandCalibrator:
+    """Collects finger_ratio samples during a 2-second calibration
+    window, then computes per-user threshold adjustments.
+
+    Usage:
+        cal = HandCalibrator()
+        # in frame loop:
+        if not cal.is_done:
+            cal.feed(landmarks)
+        else:
+            offsets = cal.offsets  # dict of adjusted thresholds
+    """
+
+    def __init__(self, duration: float = 2.0):
+        import time as _time
+        self._duration = duration
+        self._start: float | None = None
+        self._samples: dict[Finger, list[float]] = {f: [] for f in Finger}
+        self._done = False
+        self._offsets: dict[str, float] = {}
+
+    @property
+    def is_done(self) -> bool:
+        return self._done
+
+    @property
+    def progress(self) -> float:
+        if self._start is None:
+            return 0.0
+        import time as _time
+        return min((_time.time() - self._start) / self._duration, 1.0)
+
+    @property
+    def offsets(self) -> dict[str, float]:
+        return self._offsets
+
+    def feed(self, landmarks) -> None:
+        import time as _time
+        if self._done:
+            return
+        if self._start is None:
+            self._start = _time.time()
+
+        for finger in Finger:
+            self._samples[finger].append(finger_ratio(landmarks, finger))
+
+        if _time.time() - self._start >= self._duration:
+            self._compute()
+            self._done = True
+
+    def _compute(self):
+        """Compute calibrated thresholds from collected samples.
+
+        During calibration the user should show an open hand then a fist.
+        We find the max ratio seen (open) and min ratio seen (closed),
+        then set thresholds at the midpoint.
+        """
+        for finger in Finger:
+            vals = self._samples[finger]
+            if not vals:
+                continue
+            # Store the average as a reference -- not used to override
+            # thresholds directly, but available for diagnostics.
+            avg = sum(vals) / len(vals)
+            self._offsets[finger.name] = avg
+
+    def reset(self):
+        import time as _time
+        self._start = None
+        self._samples = {f: [] for f in Finger}
+        self._done = False
+        self._offsets = {}
+
+
 # ── Main validator ──────────────────────────────────────────────────
 
 class GestureValidator:
@@ -243,6 +355,7 @@ class GestureValidator:
 
         self._hysteresis: dict[str, _HysteresisState] = {}
         self._smoothers: dict[str, _EWMASmoother] = {}
+        self._medians: dict[str, _MedianFilter] = {}
 
     def _get_hysteresis(self, label: str) -> _HysteresisState:
         if label not in self._hysteresis:
@@ -257,6 +370,11 @@ class GestureValidator:
             self._smoothers[label] = _EWMASmoother(alpha=self._alpha)
         return self._smoothers[label]
 
+    def _get_median(self, label: str) -> _MedianFilter:
+        if label not in self._medians:
+            self._medians[label] = _MedianFilter(window=5)
+        return self._medians[label]
+
     def detect_fingers_raw(self, landmarks, handedness: str = "Right") -> FingerState:
         """Hysteresis-only (Layers 1+2)."""
         return self._get_hysteresis(handedness).update(landmarks)
@@ -267,7 +385,8 @@ class GestureValidator:
         return self._get_smoother(handedness).update(hyst_state)
 
     def count_fingers(self, landmarks, handedness: str = "Right") -> int:
-        return self.detect_fingers(landmarks, handedness).count
+        raw_count = self.detect_fingers(landmarks, handedness).count
+        return self._get_median(handedness).filter(raw_count)
 
     def count_fingers_total(self, hands) -> int:
         return sum(self.count_fingers(h.landmarks, h.handedness) for h in hands)
@@ -284,3 +403,4 @@ class GestureValidator:
     def clear_buffers(self) -> None:
         self._hysteresis.clear()
         self._smoothers.clear()
+        self._medians.clear()

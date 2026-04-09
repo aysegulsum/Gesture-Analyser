@@ -60,11 +60,42 @@ def _enhance_frame(bgr: np.ndarray) -> np.ndarray:
 
 # ── Persistent hand slot (survives brief tracking drops) ────────────
 
+class _SmoothedLandmark:
+    """Lightweight EMA-smoothed landmark (x, y, z)."""
+    __slots__ = ('x', 'y', 'z')
+
+    def __init__(self, x=0.0, y=0.0, z=0.0):
+        self.x, self.y, self.z = x, y, z
+
+
+def _smooth_landmarks(prev: Optional[list], curr: list, alpha: float = 0.7) -> list:
+    """Weighted moving average: alpha * current + (1-alpha) * previous.
+
+    Eliminates jitter while staying responsive (alpha=0.7 means 70%
+    weight on the current frame).
+    """
+    if prev is None or len(prev) != len(curr):
+        # First frame or size mismatch -- return current as-is but wrapped.
+        return [_SmoothedLandmark(lm.x, lm.y, lm.z) for lm in curr]
+
+    smoothed = []
+    for p, c in zip(prev, curr):
+        smoothed.append(_SmoothedLandmark(
+            x=alpha * c.x + (1.0 - alpha) * p.x,
+            y=alpha * c.y + (1.0 - alpha) * p.y,
+            z=alpha * c.z + (1.0 - alpha) * p.z,
+        ))
+    return smoothed
+
+
 class _HandSlot:
     """Holds last-known state for one hand label ("Left" or "Right").
 
     If the hand disappears for up to ``max_lost`` frames, the slot
     keeps returning its last landmarks.  After that it goes empty.
+
+    Landmarks are EMA-smoothed (0.7 * current + 0.3 * previous) to
+    reduce jitter without adding perceptible latency.
     """
 
     def __init__(self, label: str, max_lost: int = 2):
@@ -72,15 +103,21 @@ class _HandSlot:
         self.max_lost = max_lost
         self._landmarks: Optional[list] = None
         self._frame_rgb: Optional[np.ndarray] = None
-        self._lost_count: int = 999  # start as "not present"
+        self._lost_count: int = 999
+        self._no_hand_streak: int = 0  # consecutive frames with no hand
 
     def update(self, landmarks: Optional[list], frame_rgb: np.ndarray):
         if landmarks is not None:
-            self._landmarks = landmarks
+            self._landmarks = _smooth_landmarks(self._landmarks, landmarks)
             self._frame_rgb = frame_rgb
             self._lost_count = 0
+            self._no_hand_streak = 0
         else:
             self._lost_count += 1
+            self._no_hand_streak += 1
+            # After 10 frames with no hand, clear state to free memory.
+            if self._no_hand_streak >= 10:
+                self._landmarks = None
 
     @property
     def is_valid(self) -> bool:
@@ -245,14 +282,24 @@ def draw_landmarks(bgr_frame: np.ndarray, hand: HandResult) -> None:
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors["line"], 2,
     )
 
-    # -- Debug: finger-tip circles (Green=open, Red=closed) -----------------
-    from gesture_validator import finger_debug_info
+    # -- Debug: finger-tip circles + tip-to-wrist ratio labels ---------------
+    from gesture_validator import finger_debug_info, is_fist
     debug = finger_debug_info(landmarks, hand.handedness)
-    for finger, (tip_id, is_open, ratio) in debug.items():
+    fist_detected = is_fist(landmarks)
+    for finger, (tip_id, is_open, ratio, tw_ratio) in debug.items():
         tip = landmarks[tip_id]
         cx, cy = int(tip.x * w), int(tip.y * h)
         tip_color = (0, 220, 0) if is_open else (0, 0, 220)  # green / red
         cv2.circle(bgr_frame, (cx, cy), 10, tip_color, 2)
+        # Show tip-to-wrist ratio near each fingertip for threshold tuning.
+        cv2.putText(bgr_frame, f"{tw_ratio:.2f}", (cx + 12, cy - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, tip_color, 1)
+
+    # Fist indicator near wrist.
+    if fist_detected:
+        wx, wy = int(wrist.x * w), int(wrist.y * h)
+        cv2.putText(bgr_frame, "FIST", (wx - 20, wy - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 220), 2)
 
     # -- Debug bounding box (RED=Left, BLUE=Right) ------------------------
     xs = [int(lm.x * w) for lm in landmarks]

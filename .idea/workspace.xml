@@ -6,6 +6,8 @@
   <component name="ChangeListManager">
     <list default="true" id="33b3a48b-5c32-4aa4-8715-225f33e67cd4" name="Changes" comment="initial commit">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/gesture_validator.py" beforeDir="false" afterPath="$PROJECT_DIR$/gesture_validator.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/hand_tracker.py" beforeDir="false" afterPath="$PROJECT_DIR$/hand_tracker.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/liveness_session.py" beforeDir="false" afterPath="$PROJECT_DIR$/liveness_session.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
     </list>

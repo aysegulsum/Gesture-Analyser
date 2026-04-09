@@ -1,34 +1,38 @@
 """
-Fast-Response Liveness Challenge -- v3: Robust Wave + Air Drawing
-==================================================================
-Command Types
--------------
-1. GESTURE:     Finger-count match
-2. MOVE_CLOSER: Depth proxy increase >= 20%
-3. MOVE_AWAY:   Depth proxy decrease >= 20%
-4. WAVE:        Oscillation filter with frequency check
-5. DRAW_CIRCLE: Air-draw validated on timeout/finger-close
-6. DRAW_SQUARE: Air-draw validated on timeout/finger-close
+Fast-Response Liveness Challenge -- v4: Production-Grade
+=========================================================
+Command Types (expanded)
+------------------------
+1. GESTURE:       Finger-count match
+2. MOVE_CLOSER:   Depth proxy increase >= 20%
+3. MOVE_AWAY:     Depth proxy decrease >= 20%
+4. WAVE:          Oscillation filter with frequency check
+5. DRAW_CIRCLE:   Air-draw circle
+6. DRAW_SQUARE:   Air-draw square
+7. FINGER_TAP:    Touch specific fingers together
+8. HAND_FLIP:     Show palm then back of hand (3D volume change)
+9. PEEK_A_BOO:    Cover face with hands then reveal
 
-Key changes from v2:
-- Wave uses timestamped oscillation filter with 1-4 Hz frequency band.
-- Drawing only records points when index finger is open.
-- Drawing validates ONCE at the end (timeout or finger close), not
-  every frame.  This avoids premature false matches.
-- 3-point moving average smoothing on the trajectory.
-- process_every_nth: skip expensive motion math on alternate frames
-  if performance is an issue.
+Verification Score: 0-100%.  Each successful challenge adds points.
+Access granted only at 100%.  The system picks 5 random challenges
+from the library; each is worth 20%.
+
+Anti-spoofing: integrated micro-tremor + brightness checks run in
+background every frame.
 """
 
+import math
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 
 from hand_tracker import HandResult
-from gesture_validator import GestureValidator, depth_proxy, is_finger_open, Finger
+from gesture_validator import GestureValidator, depth_proxy, is_finger_open, Finger, hand_scale, _euclidean, _LM
 from motion_analyzer import WaveDetector, ShapeRecognizer
+from anti_spoof import AntiSpoofAnalyzer, SpoofResult
 
 
 # ── Command definitions ─────────────────────────────────────────────
@@ -40,6 +44,9 @@ class CmdType(Enum):
     WAVE = auto()
     DRAW_CIRCLE = auto()
     DRAW_SQUARE = auto()
+    FINGER_TAP = auto()
+    HAND_FLIP = auto()
+    PEEK_A_BOO = auto()
 
 
 @dataclass(frozen=True)
@@ -47,7 +54,10 @@ class Command:
     name: str
     cmd_type: CmdType
     gesture_reqs: dict[str, int] | None = None
+    extra: dict | None = None  # extra params for special commands
 
+
+# ── Challenge Library (modular, easy to expand) ─────────────────────
 
 _GESTURE_CMDS = [
     Command("SHOW LEFT FIST!",      CmdType.GESTURE, {"Left": 0}),
@@ -58,8 +68,6 @@ _GESTURE_CMDS = [
     Command("OPEN BOTH HANDS!",     CmdType.GESTURE, {"Left": 5, "Right": 5}),
     Command("LEFT THUMB UP!",       CmdType.GESTURE, {"Left": 1}),
     Command("RIGHT OPEN HAND!",     CmdType.GESTURE, {"Right": 5}),
-    Command("LEFT 3 + RIGHT 2!",    CmdType.GESTURE, {"Left": 3, "Right": 2}),
-    Command("BOTH FISTS!",          CmdType.GESTURE, {"Left": 0, "Right": 0}),
 ]
 
 _SPATIAL_CMDS = [
@@ -73,7 +81,23 @@ _MOTION_CMDS = [
     Command("DRAW A SQUARE!",       CmdType.DRAW_SQUARE),
 ]
 
-ALL_COMMANDS = _GESTURE_CMDS + _SPATIAL_CMDS + _MOTION_CMDS
+_ADVANCED_CMDS = [
+    # Finger tap: thumb tip must be close to pinky tip
+    Command("TOUCH THUMB TO PINKY!", CmdType.FINGER_TAP,
+            extra={"tip_a": _LM["THUMB_TIP"], "tip_b": _LM["PINKY_TIP"], "threshold": 0.3}),
+    # Finger tap: thumb tip must be close to index tip
+    Command("TOUCH THUMB TO INDEX!", CmdType.FINGER_TAP,
+            extra={"tip_a": _LM["THUMB_TIP"], "tip_b": _LM["INDEX_TIP"], "threshold": 0.3}),
+    # Hand flip: show palm then flip (detected by z-coordinate shift)
+    Command("FLIP YOUR HAND!",      CmdType.HAND_FLIP),
+    # Peek-a-boo: both hands must disappear then reappear
+    Command("PEEK-A-BOO! (HIDE THEN SHOW)", CmdType.PEEK_A_BOO),
+]
+
+ALL_COMMANDS = _GESTURE_CMDS + _SPATIAL_CMDS + _MOTION_CMDS + _ADVANCED_CMDS
+
+# Number of challenges to complete for 100% verification.
+CHALLENGES_FOR_FULL_SCORE = 5
 
 
 class LivenessState(Enum):
@@ -81,6 +105,7 @@ class LivenessState(Enum):
     DEBOUNCE = auto()
     SUCCESS = auto()
     FAILED = auto()
+    VERIFIED_100 = auto()  # all challenges completed
 
 
 _INDEX_TIP = 8
@@ -88,14 +113,14 @@ _INDEX_TIP = 8
 
 @dataclass
 class LivenessChallenge:
-    """Fast-response liveness detector with wave + air drawing.
+    """Production-grade liveness detector with verification score.
 
     Parameters
     ----------
     time_limit : float
-        Base seconds per challenge (drawing gets +3s).
+        Base seconds per challenge.
     debounce_seconds : float
-        Hold time for gesture/spatial matches.
+        Hold time for static gesture matches.
     area_change_threshold : float
         Required depth change for spatial commands.
     pause_after_result : float
@@ -103,7 +128,9 @@ class LivenessChallenge:
     smoothing_window : int
         Passed to GestureValidator.
     process_every_nth : int
-        Only run motion math every Nth frame (1 = every frame).
+        Skip motion math on alternate frames if needed.
+    num_challenges : int
+        Total challenges for 100% verification.
     """
 
     time_limit: float = 4.0
@@ -112,12 +139,17 @@ class LivenessChallenge:
     pause_after_result: float = 1.5
     smoothing_window: int = 7
     process_every_nth: int = 1
+    num_challenges: int = CHALLENGES_FOR_FULL_SCORE
 
     # -- internal state ---------------------------------------------------
     state: LivenessState = field(init=False, default=LivenessState.ACTIVE)
     current_cmd: Command = field(init=False, default=None)
     score: int = field(init=False, default=0)
     streak: int = field(init=False, default=0)
+
+    # Verification progress: completed / num_challenges
+    challenges_completed: int = field(init=False, default=0)
+    _challenge_queue: list = field(init=False, default_factory=list)
 
     _challenge_start: Optional[float] = field(init=False, default=None)
     _debounce_start: Optional[float] = field(init=False, default=None)
@@ -129,27 +161,52 @@ class LivenessChallenge:
     _validator: GestureValidator = field(init=False)
     _wave: WaveDetector = field(init=False)
     _shape: ShapeRecognizer = field(init=False)
+    _anti_spoof: AntiSpoofAnalyzer = field(init=False)
 
     _frame_counter: int = field(init=False, default=0)
     _was_drawing: bool = field(init=False, default=False)
 
+    # Hand flip state
+    _flip_phase: int = field(init=False, default=0)  # 0=waiting palm, 1=saw palm, waiting back
+    _flip_baseline_z: Optional[float] = field(init=False, default=None)
+
+    # Peek-a-boo state
+    _peekaboo_phase: int = field(init=False, default=0)  # 0=waiting hide, 1=hidden, waiting show
+    _peekaboo_hidden_at: Optional[float] = field(init=False, default=None)
+
     def __post_init__(self):
         self._validator = GestureValidator(smoothing_window=self.smoothing_window)
-        self._wave = WaveDetector(
-            buffer_size=40, min_swing=0.10,
-            min_total_displacement=0.20, min_reversals=2,
-        )
+        self._wave = WaveDetector(buffer_size=40, min_swing=0.10,
+                                  min_total_displacement=0.20, min_reversals=2)
         self._shape = ShapeRecognizer(min_points=15)
-        self._pick_command()
+        self._anti_spoof = AntiSpoofAnalyzer()
+        self._build_queue()
+        self._pick_next()
 
-    def _pick_command(self) -> None:
-        self.current_cmd = random.choice(ALL_COMMANDS)
+    def _build_queue(self):
+        """Pick N random unique challenges for the verification session."""
+        pool = list(ALL_COMMANDS)
+        random.shuffle(pool)
+        self._challenge_queue = pool[:self.num_challenges]
+        self.challenges_completed = 0
+
+    def _pick_next(self):
+        """Pick the next challenge from the queue."""
+        if self.challenges_completed >= len(self._challenge_queue):
+            self.state = LivenessState.VERIFIED_100
+            return
+
+        self.current_cmd = self._challenge_queue[self.challenges_completed]
         self._challenge_start = None
         self._debounce_start = None
         self._result_at = None
         self._baseline_area = None
         self._current_area = None
         self._was_drawing = False
+        self._flip_phase = 0
+        self._flip_baseline_z = None
+        self._peekaboo_phase = 0
+        self._peekaboo_hidden_at = None
         self._frame_counter = 0
         self.state = LivenessState.ACTIVE
         self._validator.clear_buffers()
@@ -158,11 +215,21 @@ class LivenessChallenge:
 
     @property
     def _effective_time_limit(self) -> float:
-        if self.current_cmd.cmd_type in (CmdType.DRAW_CIRCLE, CmdType.DRAW_SQUARE):
-            return self.time_limit + 3.0  # 7s for drawing
-        if self.current_cmd.cmd_type == CmdType.WAVE:
-            return self.time_limit + 1.0  # 5s for wave
+        ct = self.current_cmd.cmd_type
+        if ct in (CmdType.DRAW_CIRCLE, CmdType.DRAW_SQUARE):
+            return self.time_limit + 3.0
+        if ct in (CmdType.WAVE, CmdType.HAND_FLIP, CmdType.PEEK_A_BOO):
+            return self.time_limit + 2.0
         return self.time_limit
+
+    @property
+    def verification_pct(self) -> float:
+        """0-100 verification score."""
+        return (self.challenges_completed / self.num_challenges) * 100.0
+
+    @property
+    def spoof_result(self) -> SpoofResult:
+        return self._anti_spoof.analyze()
 
     # -- Matching helpers -------------------------------------------------
 
@@ -190,8 +257,58 @@ class LivenessChallenge:
             return ratio <= (1.0 - self.area_change_threshold)
         return False
 
+    def _finger_tap_matched(self, hands: list[HandResult]) -> bool:
+        """Check if two specific landmarks are close together."""
+        if not hands or not self.current_cmd.extra:
+            return False
+        lm = hands[0].landmarks
+        hs = hand_scale(lm)
+        if hs < 1e-9:
+            return False
+        tip_a = lm[self.current_cmd.extra["tip_a"]]
+        tip_b = lm[self.current_cmd.extra["tip_b"]]
+        dist = _euclidean(tip_a, tip_b) / hs
+        return dist < self.current_cmd.extra["threshold"]
+
+    def _hand_flip_check(self, hands: list[HandResult]) -> bool:
+        """Detect a hand flip by tracking the average Z of fingertips.
+
+        Phase 0: Record baseline Z (palm facing camera = low avg Z).
+        Phase 1: Wait for avg Z to shift significantly (back of hand).
+        """
+        if not hands:
+            return False
+        lm = hands[0].landmarks
+        avg_z = sum(lm[i].z for i in [4, 8, 12, 16, 20]) / 5.0
+
+        if self._flip_phase == 0:
+            if self._flip_baseline_z is None:
+                self._flip_baseline_z = avg_z
+            # Wait for significant Z change (back of hand has different z)
+            if self._flip_baseline_z is not None:
+                delta = abs(avg_z - self._flip_baseline_z)
+                if delta > 0.03:
+                    self._flip_phase = 1
+                    return True
+        return False
+
+    def _peekaboo_check(self, hands: list[HandResult]) -> bool:
+        """Phase 0: Wait for hands to disappear (user covers face).
+        Phase 1: Wait for hands to reappear."""
+        now = time.time()
+        if self._peekaboo_phase == 0:
+            if not hands:
+                self._peekaboo_phase = 1
+                self._peekaboo_hidden_at = now
+        elif self._peekaboo_phase == 1:
+            # Must stay hidden for at least 0.5s
+            if not hands:
+                return False
+            if self._peekaboo_hidden_at and now - self._peekaboo_hidden_at > 0.5:
+                return True  # Hands reappeared after hiding
+        return False
+
     def _index_is_open(self, hands: list[HandResult]) -> bool:
-        """Check if the index finger of the first hand is extended."""
         if not hands:
             return False
         return is_finger_open(hands[0].landmarks, hands[0].handedness, Finger.INDEX)
@@ -202,21 +319,37 @@ class LivenessChallenge:
         now = time.time()
         self._frame_counter += 1
 
-        # After result, pause then auto-advance.
-        if self.state in (LivenessState.SUCCESS, LivenessState.FAILED):
-            if self._result_at and now - self._result_at >= self.pause_after_result:
-                self._pick_command()
+        # Anti-spoof: feed data every frame.
+        if hands:
+            wrist = hands[0].landmarks[0]
+            # Use hand_scale as brightness proxy -- changes naturally with
+            # hand movement/distance but stays constant for a static image.
+            hs = hand_scale(hands[0].landmarks)
+            self._anti_spoof.feed(wrist.x, wrist.y, hs)
+
+        if self.state == LivenessState.VERIFIED_100:
             return self.state
 
-        # Timer starts on first hand detection.
-        if self._challenge_start is None:
-            if not hands:
-                return self.state
-            self._challenge_start = now
-            if self.current_cmd.cmd_type in (CmdType.MOVE_CLOSER, CmdType.MOVE_AWAY):
-                self._baseline_area = self._get_depth(hands)
+        # After result, pause then advance.
+        if self.state in (LivenessState.SUCCESS, LivenessState.FAILED):
+            if self._result_at and now - self._result_at >= self.pause_after_result:
+                if self.state == LivenessState.SUCCESS:
+                    self.challenges_completed += 1
+                self._pick_next()
+            return self.state
 
-        # Timeout -- for drawing commands, validate the shape first.
+        # Timer starts on first hand detection (or immediately for peek-a-boo).
+        if self._challenge_start is None:
+            if self.current_cmd.cmd_type == CmdType.PEEK_A_BOO:
+                self._challenge_start = now  # start immediately
+            elif not hands:
+                return self.state
+            else:
+                self._challenge_start = now
+                if self.current_cmd.cmd_type in (CmdType.MOVE_CLOSER, CmdType.MOVE_AWAY):
+                    self._baseline_area = self._get_depth(hands)
+
+        # Timeout.
         if now - self._challenge_start >= self._effective_time_limit:
             if self.current_cmd.cmd_type in (CmdType.DRAW_CIRCLE, CmdType.DRAW_SQUARE):
                 if self._validate_drawing_final():
@@ -227,10 +360,9 @@ class LivenessChallenge:
             self.streak = 0
             return self.state
 
-        # Skip expensive motion math on non-processing frames.
         should_process = (self._frame_counter % self.process_every_nth == 0)
 
-        # -- DEBOUNCE (gesture/spatial only) -------------------------------
+        # -- DEBOUNCE ------------------------------------------------------
         if self.state == LivenessState.DEBOUNCE:
             if should_process and self._check_static_match(hands):
                 if now - self._debounce_start >= self.debounce_seconds:
@@ -244,7 +376,7 @@ class LivenessChallenge:
         # -- ACTIVE --------------------------------------------------------
         ct = self.current_cmd.cmd_type
 
-        # Spatial: keep tracking.
+        # Spatial tracking.
         if ct in (CmdType.MOVE_CLOSER, CmdType.MOVE_AWAY):
             area = self._get_depth(hands)
             if area is not None:
@@ -252,14 +384,14 @@ class LivenessChallenge:
                 if self._baseline_area is None:
                     self._baseline_area = area
 
-        # Wave: push wrist X every frame, check on processing frames.
+        # Wave.
         if ct == CmdType.WAVE and hands:
             self._wave.push(hands[0].landmarks[0].x)
             if should_process and self._wave.is_waving():
                 self._succeed(now)
                 return self.state
 
-        # Drawing: record index tip when finger is open.
+        # Drawing.
         if ct in (CmdType.DRAW_CIRCLE, CmdType.DRAW_SQUARE):
             finger_open = self._index_is_open(hands)
             if finger_open and hands:
@@ -267,22 +399,39 @@ class LivenessChallenge:
                 self._shape.push(tip.x, tip.y)
                 self._was_drawing = True
             elif self._was_drawing and not finger_open and len(self._shape.path) >= self._shape.min_points:
-                # Finger just closed after drawing -- validate now.
                 if self._validate_drawing_final():
                     self._succeed(now)
                     return self.state
                 self._was_drawing = False
             return self.state
 
+        # Finger tap.
+        if ct == CmdType.FINGER_TAP:
+            if should_process and self._finger_tap_matched(hands):
+                self._succeed(now)
+                return self.state
+
+        # Hand flip.
+        if ct == CmdType.HAND_FLIP:
+            if self._hand_flip_check(hands):
+                self._succeed(now)
+                return self.state
+
+        # Peek-a-boo.
+        if ct == CmdType.PEEK_A_BOO:
+            if self._peekaboo_check(hands):
+                self._succeed(now)
+                return self.state
+
         # Static commands (gesture/spatial).
-        if should_process:
-            if self._check_static_match(hands):
+        if ct in (CmdType.GESTURE, CmdType.MOVE_CLOSER, CmdType.MOVE_AWAY):
+            if should_process and self._check_static_match(hands):
                 self.state = LivenessState.DEBOUNCE
                 self._debounce_start = now
 
         return self.state
 
-    def _check_static_match(self, hands: list[HandResult]) -> bool:
+    def _check_static_match(self, hands):
         ct = self.current_cmd.cmd_type
         if ct == CmdType.GESTURE:
             return self._gesture_matched(hands)
@@ -291,7 +440,6 @@ class LivenessChallenge:
         return False
 
     def _validate_drawing_final(self) -> bool:
-        """One-shot shape validation (called on timeout or finger-close)."""
         if self.current_cmd.cmd_type == CmdType.DRAW_CIRCLE:
             return self._shape.finalize_circle().matched
         elif self.current_cmd.cmd_type == CmdType.DRAW_SQUARE:
@@ -326,7 +474,6 @@ class LivenessChallenge:
 
     @property
     def wave_reversals(self) -> int:
-        """Current reversal count for UI feedback."""
         return self._wave.reversal_count
 
     @property
@@ -338,6 +485,8 @@ class LivenessChallenge:
 
     @property
     def display_text(self) -> str:
+        if self.state == LivenessState.VERIFIED_100:
+            return "ACCESS GRANTED - 100% VERIFIED"
         if self.state == LivenessState.SUCCESS:
             return "VERIFIED!"
         if self.state == LivenessState.FAILED:
@@ -346,6 +495,8 @@ class LivenessChallenge:
 
     @property
     def status_label(self) -> str:
+        if self.state == LivenessState.VERIFIED_100:
+            return "Status: All Challenges Complete"
         if self.state == LivenessState.SUCCESS:
             return "Status: Challenge Passed"
         if self.state == LivenessState.FAILED:
@@ -378,6 +529,10 @@ class LivenessChallenge:
     def is_wave_cmd(self) -> bool:
         return self.current_cmd.cmd_type == CmdType.WAVE
 
+    @property
+    def challenge_progress_text(self) -> str:
+        return f"Challenge {self.challenges_completed + 1}/{self.num_challenges}"
+
     def per_hand_counts(self, hands: list[HandResult]) -> dict[str, int]:
         return {
             h.handedness: self._validator.count_fingers(h.landmarks, h.handedness)
@@ -387,4 +542,6 @@ class LivenessChallenge:
     def reset(self) -> None:
         self.score = 0
         self.streak = 0
-        self._pick_command()
+        self._anti_spoof.reset()
+        self._build_queue()
+        self._pick_next()

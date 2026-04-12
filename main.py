@@ -538,119 +538,52 @@ def _draw_shape_template(frame, template, w: int, h: int,
         cv2.circle(frame, (sx, sy), 9, GREEN, -1)
 
 
-# ── Shape info panel (top-left, clears the centre canvas) ────────────────
+# ── Shape status text (fixed top-left) ───────────────────────────────────
 
 def _draw_shape_info_panel(frame, st, label: str, w: int, h: int) -> None:
-    """Render all shape-tracing status text in a semi-transparent top-left panel.
-
-    The centre of the frame is kept clear for the shape and the finger path.
-    Each TracerState gets a tailored message set with an inline progress bar.
+    """Render shape-tracing status as plain text lines at a fixed top-left
+    position.  No overlays, no dynamic geometry — just put_text_with_bg
+    calls starting at (x=20, y=130), one line per state.
     """
     from shape_tracer import TracerState as TS
 
-    FONT    = cv2.FONT_HERSHEY_SIMPLEX
-    PAD_X   = 10
-    PAD_Y   = 8
-    LINE_H  = 23
-    PX, PY  = 12, 108   # panel origin (below challenge-progress + score rows)
-    PW      = 335        # panel width
-
-    # ── Build line list ───────────────────────────────────────────────
-    lines: list[tuple[str, tuple]] = []   # (text, bgr_colour)
+    TX     = 20    # fixed left edge
+    TY     = 130   # first line y — below the score row at ~y=85
+    LINE_H = 24    # gap between lines
 
     if st.state == TS.INSTRUCTING:
         rem = st.instruct_remaining
-        lines = [
-            (label,                              CYAN),
-            ("Position index finger over",       WHITE),
-            ("the green  START  point,",         WHITE),
-            ("then hold to begin tracing.",      WHITE),
-            (f"Auto-starts in  {rem:.1f} s ...", YELLOW),
-        ]
-        bar_progress = st.instruct_progress
-        bar_color    = YELLOW
+        put_text_with_bg(frame, f"{label}  —  Trace the shape",
+                         (TX, TY), font_scale=0.55, color=CYAN)
+        put_text_with_bg(frame, "Hover index finger over the green START dot.",
+                         (TX, TY + LINE_H), font_scale=0.55, color=WHITE)
+        put_text_with_bg(frame, f"Auto-starts in {rem:.1f} s",
+                         (TX, TY + LINE_H * 2), font_scale=0.55, color=YELLOW)
 
     elif st.state == TS.IDLE:
-        lines = [
-            (label,                              CYAN),
-            ("Hover index finger over",          WHITE),
-            ("the pulsing green START point.",   WHITE),
-        ]
-        bar_progress = None
-        bar_color    = None
+        put_text_with_bg(frame, f"{label}  —  Trace the shape",
+                         (TX, TY), font_scale=0.55, color=CYAN)
+        put_text_with_bg(frame, "Move index finger to the green START dot.",
+                         (TX, TY + LINE_H), font_scale=0.55, color=WHITE)
 
     elif st.state == TS.POSITIONING:
         pct = int(st.position_progress * 100)
-        lines = [
-            (label,                              CYAN),
-            (f"Hold steady...  {pct}%",          GREEN),
-            ("Keep finger on START point.",      WHITE),
-        ]
-        bar_progress = st.position_progress
-        bar_color    = GREEN
+        put_text_with_bg(frame, f"{label}  —  Hold steady... {pct}%",
+                         (TX, TY), font_scale=0.55, color=GREEN)
+        put_text_with_bg(frame, "Keep finger on START dot to begin.",
+                         (TX, TY + LINE_H), font_scale=0.55, color=WHITE)
 
     elif st.state == TS.TRACING:
         rem   = st.time_remaining
         t_col = RED if rem < 2 else YELLOW if rem < 4 else GREEN
-        lines = [
-            (f"  RECORDING  {label}",            RED),
-            (f"{st.point_count} points  |  {rem:.1f} s left", t_col),
-            ("Reach END point, or close fist.",  WHITE),
-        ]
-        bar_progress = 1.0 - st.draw_progress   # remaining fraction
-        bar_color    = t_col
+        put_text_with_bg(frame, f"{label}  —  RECORDING",
+                         (TX, TY), font_scale=0.55, color=RED)
+        put_text_with_bg(frame, f"{st.point_count} pts  |  {rem:.1f} s  —  reach END or close fist",
+                         (TX, TY + LINE_H), font_scale=0.55, color=t_col)
 
     elif st.state == TS.COMPLETED:
-        lines = [
-            (label,                              CYAN),
-            ("Analysing trace...",               YELLOW),
-        ]
-        bar_progress = None
-        bar_color    = None
-
-    else:
-        return   # VERIFIED / FAILED handled by the liveness state block
-
-    if not lines:
-        return
-
-    has_bar  = bar_progress is not None
-    panel_h  = len(lines) * LINE_H + 2 * PAD_Y + (8 if has_bar else 0)
-
-    # ── Semi-transparent dark background ─────────────────────────────
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (PX, PY), (PX + PW, PY + panel_h), (15, 15, 15), -1)
-    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
-
-    # Coloured left accent bar.
-    accent = GREEN if st.state in (TS.POSITIONING, TS.IDLE) else \
-             RED   if st.state == TS.TRACING               else CYAN
-    cv2.rectangle(frame, (PX, PY), (PX + 3, PY + panel_h), accent, -1)
-
-    # Thin border.
-    cv2.rectangle(frame, (PX, PY), (PX + PW, PY + panel_h), (80, 80, 80), 1)
-
-    # ── Text lines ────────────────────────────────────────────────────
-    # Blinking red dot for TRACING state.
-    show_blink_dot = (st.state == TS.TRACING and int(time.time() * 2) % 2 == 0)
-
-    for i, (text, color) in enumerate(lines):
-        ty = PY + PAD_Y + (i + 1) * LINE_H - 5
-        if i == 0 and show_blink_dot:
-            # Draw blinking record indicator on line 0.
-            cv2.circle(frame, (PX + PAD_X + 5, ty - 7), 5, RED, -1)
-        tx = PX + PAD_X + (16 if (i == 0 and show_blink_dot) else 0)
-        cv2.putText(frame, text, (tx, ty), FONT, 0.48, color, 1, cv2.LINE_AA)
-
-    # ── Inline progress bar ───────────────────────────────────────────
-    if has_bar:
-        bx1 = PX + PAD_X
-        bx2 = PX + PW - PAD_X
-        by  = PY + panel_h - PAD_Y
-        filled = int((bx2 - bx1) * max(0.0, min(1.0, bar_progress)))
-        cv2.rectangle(frame, (bx1, by - 4), (bx2, by), (50, 50, 50), -1)
-        if filled > 0:
-            cv2.rectangle(frame, (bx1, by - 4), (bx1 + filled, by), bar_color, -1)
+        put_text_with_bg(frame, f"{label}  —  Analysing...",
+                         (TX, TY), font_scale=0.55, color=YELLOW)
 
 
 def _draw_traced_path(frame, traced, w: int, h: int) -> None:

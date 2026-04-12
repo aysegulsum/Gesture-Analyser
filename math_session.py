@@ -1,9 +1,9 @@
 """
 Math Challenge Session
 ======================
-Generates simple arithmetic questions (addition / subtraction) where
-the answer is 0-10.  The user "solves" by showing the correct number
-of fingers with one or both hands.
+Generates controlled arithmetic questions (addition, subtraction,
+multiplication, division) where the answer is always in [0, 10].
+The user solves each question by showing the correct number of fingers.
 
     WAITING  ->  HOLDING  ->  SUCCESS  ->  (next question)
        ^                         |
@@ -12,6 +12,15 @@ of fingers with one or both hands.
 The 60-second countdown starts when the first question appears.
 After time runs out the session enters GAME_OVER and no more
 questions are generated.
+
+Question format: ``a OP b = ?``  (user must show the answer in fingers)
+
+Operand constraints
+-------------------
+  Addition:       a + b = ?   a, b >= 0  and  a + b <= 10
+  Subtraction:    a - b = ?   b >= 0     and  a - b >= 0  and  a <= 10
+  Multiplication: a × b = ?   a, b >= 0  and  a × b <= 10
+  Division:       a ÷ b = ?   b >= 1,    a % b == 0,  a // b <= 10
 
 Framework-agnostic: feed ``update(hands)`` each frame, read back
 ``display_text`` / ``status_label`` / ``equation_text`` to render.
@@ -26,6 +35,62 @@ from typing import Optional
 from hand_tracker import HandResult
 from gesture_validator import GestureValidator
 
+
+# ── Controlled question generator ───────────────────────────────────
+
+# Pre-built table of every valid (a, b) pair for multiplication so we
+# never loop at runtime — just pick randomly from this constant list.
+_MUL_PAIRS: list[tuple[int, int]] = [
+    (a, b)
+    for a in range(0, 11)
+    for b in range(0, 11)
+    if a * b <= 10
+]
+
+
+def generate_controlled_math_challenge() -> tuple[str, int]:
+    """Return a (question_string, answer) pair where answer is in [0, 10].
+
+    One of four operations is chosen at random.  Operands are generated
+    so that the result always falls within the range the user can show on
+    their fingers (0 – 10).
+
+    Constraints per operation
+    -------------------------
+    Addition       a + b = ?   a, b >= 0  and  a + b <= 10
+    Subtraction    a - b = ?   b >= 0     and  a - b >= 0  and  a <= 10
+    Multiplication a × b = ?   a, b >= 0  and  a × b <= 10
+    Division       a ÷ b = ?   b >= 1,    a % b == 0,  a // b <= 10
+    """
+    op = random.choice(["add", "sub", "mul", "div"])
+
+    if op == "add":
+        # Pick the answer first, then split it across two non-negative terms.
+        answer = random.randint(0, 10)
+        a = random.randint(0, answer)
+        b = answer - a
+        return f"{a} + {b} = ?", answer
+
+    if op == "sub":
+        # answer = a - b  =>  a = answer + b  (keep a <= 10)
+        answer = random.randint(0, 10)
+        b = random.randint(0, 10 - answer)
+        a = answer + b
+        return f"{a} - {b} = ?", answer
+
+    if op == "mul":
+        # Choose from the pre-built table — guarantees product <= 10.
+        a, b = random.choice(_MUL_PAIRS)
+        return f"{a} x {b} = ?", a * b
+
+    # div: pick answer then a random divisor; dividend = answer * divisor
+    answer = random.randint(0, 10)
+    b = random.randint(1, 10)           # divisor >= 1, no division by zero
+    a = answer * b                      # a % b == 0 and a // b == answer
+    return f"{a} / {b} = ?", answer
+
+
+# ── Session state machine ────────────────────────────────────────────
 
 class MathState(Enum):
     WAITING = auto()    # waiting for correct gesture
@@ -76,24 +141,11 @@ class MathSession:
     # -- Question generator -----------------------------------------------
 
     def _generate_question(self) -> None:
-        """Create a random equation ``a OP ? = c`` with answer in 0-10."""
-        answer = random.randint(0, 10)
-
-        if random.choice(["add", "sub"]) == "add":
-            # a + ? = c  ->  a can be 0..(10 - answer)
-            a = random.randint(0, 10 - answer)
-            c = a + answer
-            self._equation = f"{a} + ? = {c}"
-        else:
-            # c - ? = a  ->  present as ``c - ? = a``
-            a = random.randint(0, 10 - answer)
-            c = a + answer
-            self._equation = f"{c} - ? = {a}"
-
-        self._answer = answer
+        """Delegate to the module-level generator and store results."""
+        self._equation, self._answer = generate_controlled_math_challenge()
         self._match_start = None
-        self._success_at = None
-        self._last_total = None
+        self._success_at  = None
+        self._last_total  = None
         self._validator.clear_buffers()
 
     # -- Public API -------------------------------------------------------
@@ -185,7 +237,7 @@ class MathSession:
         if self.state == MathState.GAME_OVER:
             return f"TIME'S UP!  Final Score: {self.score}"
         if self.state == MathState.SUCCESS:
-            return f"SUCCESS!  Score: {self.score}"
+            return f"CORRECT!  Score: {self.score}"
         return f"Solve:  {self._equation}"
 
     @property

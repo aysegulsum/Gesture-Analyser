@@ -81,6 +81,9 @@ anti_spoof:
   tremor_warmup_frames:  90      # startup frames before flagging (~3 s at 30 fps)
   brightness_min_var:    0.05    # min brightness std-dev (below = static image)
   brightness_buffer:     60      # number of brightness samples to keep
+  block_frames:          45      # consecutive suspicious frames before hard-blocking
+                                 # (~1.5 s at 30 fps). Raise to tolerate brief freezes;
+                                 # lower for stricter, faster rejection.
 
 
 # ── Math Challenge ────────────────────────────────────────────────────────────

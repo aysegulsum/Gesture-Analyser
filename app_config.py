@@ -89,6 +89,7 @@ class AntiSpoofConfig:
     tremor_warmup_frames:  int   = 90
     brightness_min_var:    float = 0.05
     brightness_buffer:     int   = 60
+    block_frames:          int   = 45   # sustained suspicious frames → hard FAILED block
 
 
 @dataclass

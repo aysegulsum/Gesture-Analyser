@@ -599,6 +599,24 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
 
     spoof = lv.spoof_result
 
+    # -- Anti-spoof warning bar -------------------------------------------
+    # Shown only while a challenge is live (not during result pause).
+    # Orange fill grows from right-to-left as suspicious frames accumulate.
+    # Turns solid red the frame the gate fires (state becomes FAILED).
+    warn_pct = lv.spoof_warning_progress
+    if warn_pct > 0 and ls in (LivenessState.ACTIVE, LivenessState.DEBOUNCE):
+        bar_w = int(w * 0.22)
+        bar_x = w - bar_w - 10
+        bar_y = 10
+        bar_h = 14
+        fill_w = int(bar_w * warn_pct)
+        bar_col = RED if warn_pct >= 1.0 else ORANGE
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), DARK_BG, -1)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), bar_col, -1)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), ORANGE, 1)
+        put_text_with_bg(frame, "ANTI-SPOOF", (bar_x, bar_y + bar_h + 14),
+                         font_scale=0.38, color=ORANGE, bg=DARK_BG, thickness=1)
+
     # -- 100% verified state ----------------------------------------------
     if ls == LivenessState.VERIFIED_100:
         put_text_centered(frame, "ACCESS GRANTED", h // 2 - 30, font_scale=1.4, color=GREEN, thickness=3)
@@ -618,18 +636,28 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
                              f"Similarity: {pct:.0f}%  DTW: {lv.shape_tracer.dtw_cost:.3f}",
                              (12, 108), font_scale=0.55, color=s_color)
     elif ls == LivenessState.FAILED:
-        put_text_centered(frame, "FAILED!", h // 2 - 20,
-                          font_scale=1.4, color=RED, thickness=3)
-        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
-            pct = lv.shape_tracer.similarity_pct
-            put_text_with_bg(frame,
-                             f"Similarity: {pct:.0f}%  (need DTW <= 0.25)",
-                             (12, 108), font_scale=0.55, color=YELLOW)
-            put_text_with_bg(frame, "Next challenge incoming...",
-                             (12, 132), font_scale=0.52, color=YELLOW)
-        else:
+        if lv.is_spoof_blocked:
+            # Distinct banner for anti-spoof gate — orange tone to distinguish
+            # from a regular timeout failure (which uses RED).
+            put_text_centered(frame, "SPOOF DETECTED!", h // 2 - 40,
+                              font_scale=1.3, color=ORANGE, thickness=3)
+            put_text_centered(frame, "Static image / frozen video blocked.",
+                              h // 2 + 5, font_scale=0.65, color=ORANGE)
             put_text_centered(frame, "Next challenge incoming...",
-                              h // 2 + 55, font_scale=0.7, color=YELLOW)
+                              h // 2 + 45, font_scale=0.65, color=YELLOW)
+        else:
+            put_text_centered(frame, "FAILED!", h // 2 - 20,
+                              font_scale=1.4, color=RED, thickness=3)
+            if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+                pct = lv.shape_tracer.similarity_pct
+                put_text_with_bg(frame,
+                                 f"Similarity: {pct:.0f}%  (need DTW <= 0.25)",
+                                 (12, 108), font_scale=0.55, color=YELLOW)
+                put_text_with_bg(frame, "Next challenge incoming...",
+                                 (12, 132), font_scale=0.52, color=YELLOW)
+            else:
+                put_text_centered(frame, "Next challenge incoming...",
+                                  h // 2 + 55, font_scale=0.7, color=YELLOW)
     else:
         cmd_color = ORANGE if ls == LivenessState.DEBOUNCE else CYAN
         # Shape-trace: suppress the centre command label (panel handles it).

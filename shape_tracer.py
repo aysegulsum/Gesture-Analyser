@@ -294,97 +294,20 @@ def dtw_normalised_cost(
     return float(dtw[n, m]) / max(n, m)
 
 
-# ── Proximity helpers ────────────────────────────────────────────────
-#
-# The trigger radius (invisible collision zone) is deliberately larger
-# than the visual dot drawn on screen.  This makes it easier for users
-# to "hit" the start/end points without pixel-perfect precision.
-#
-# Visual dot radius is handled in main.py (_draw_shape_template).
-# These constants are pure logic radii in normalised [0, 1] coords.
+# ── Proximity helper ─────────────────────────────────────────────────
 
-START_TRIGGER_RADIUS = 0.08   # invisible trigger zone  (larger than visual dot)
-END_TRIGGER_RADIUS   = 0.09   # end-point trigger zone
-# Arm trigger: once finger moves beyond ARM_RADIUS from start, end trigger activates.
-ARM_RADIUS           = 0.11
-
-# Keep legacy aliases so external callers (eval session) don't break.
-START_RADIUS = START_TRIGGER_RADIUS
-END_RADIUS   = END_TRIGGER_RADIUS
+# Radius (in normalised [0,1] screen coords) for start/end trigger zones.
+START_RADIUS = 0.06
+END_RADIUS   = 0.07
+# When finger is farther than this from start_point, _start_armed becomes True.
+ARM_RADIUS   = 0.10
 
 
 def _finger_near_point(fx: float, fy: float,
                        px: float, py: float,
-                       radius: float = START_TRIGGER_RADIUS) -> bool:
+                       radius: float = START_RADIUS) -> bool:
     """Return True if (fx, fy) is within *radius* of (px, py)."""
     return math.sqrt((fx - px) ** 2 + (fy - py) ** 2) <= radius
-
-
-# ── Jitter / velocity analysis ───────────────────────────────────────
-#
-# Real human fingers exhibit natural micro-tremors: their per-frame
-# velocity has moderate variance (coefficient of variation ≈ 0.2–1.2).
-# A static printed photo or a robotic arm shows near-zero velocity
-# variance (CV → 0) or zero mean velocity (photo held still).
-#
-# We compute a *jitter_score* in [0, 1]:
-#   1.0 = clearly human  |  0.0 = clearly robotic / static
-# and a boolean *jitter_suspicious* flag.  A suspicious trace receives
-# a similarity penalty before the DTW threshold is checked.
-
-_JITTER_MIN_SAMPLES = 12      # need at least this many velocity samples
-_JITTER_STATIC_VEL  = 0.0015  # per-frame velocity below which = near-static
-_JITTER_STATIC_FRAC = 0.55    # if > 55 % of frames are static → suspicious
-_JITTER_MIN_CV      = 0.12    # CV below this = suspiciously smooth (robot)
-_JITTER_MAX_CV      = 2.0     # CV above this = suspiciously jerky
-
-
-def _analyse_jitter(velocities: list[float]) -> tuple[bool, float]:
-    """Return (suspicious, jitter_score) from a list of per-frame velocities.
-
-    Parameters
-    ----------
-    velocities : list of per-frame Euclidean distances in normalised coords.
-
-    Returns
-    -------
-    suspicious : bool  – True if movement pattern is not human-like.
-    score      : float – 0 (robotic) … 1 (human-like).
-    """
-    n = len(velocities)
-    if n < _JITTER_MIN_SAMPLES:
-        return False, 0.5   # not enough data → give benefit of the doubt
-
-    mean_v = sum(velocities) / n
-    if mean_v < _JITTER_STATIC_VEL * 0.3:
-        # Essentially no movement at all — static photo.
-        return True, 0.0
-
-    variance = sum((v - mean_v) ** 2 for v in velocities) / n
-    std_dev  = math.sqrt(variance)
-    cv       = std_dev / max(mean_v, 1e-9)
-
-    # Fraction of frames with near-zero velocity (hand not moving).
-    static_frac = sum(1 for v in velocities if v < _JITTER_STATIC_VEL) / n
-    if static_frac > _JITTER_STATIC_FRAC:
-        # More than half the path is static — likely a printed image.
-        return True, max(0.0, 1.0 - static_frac)
-
-    # Score based on coefficient of variation.
-    if cv < _JITTER_MIN_CV:
-        # Suspiciously smooth — robot or mechanical motion.
-        score      = cv / _JITTER_MIN_CV         # 0 → 1 as cv → min_cv
-        suspicious = score < 0.6
-    elif cv <= _JITTER_MAX_CV:
-        # Normal human range.
-        score      = 1.0
-        suspicious = False
-    else:
-        # Suspiciously jerky — could be mechanical choppiness.
-        score      = max(0.0, 1.0 - (cv - _JITTER_MAX_CV) / 2.0)
-        suspicious = score < 0.4
-
-    return suspicious, round(score, 3)
 
 
 # ── Tracer state machine ─────────────────────────────────────────────
@@ -440,17 +363,14 @@ class ShapeTracerSession:
     pause_after_result: float = 2.0
 
     # -- observable (read by HUD) -----------------------------------------
-    state:             TracerState = field(init=False, default=TracerState.INSTRUCTING)
-    template:          ShapeTemplate = field(init=False)
-    similarity:        float = field(init=False, default=0.0)   # 0 … 1
-    dtw_cost:          float = field(init=False, default=0.0)
-    jitter_score:      float = field(init=False, default=0.5)   # 0=robotic … 1=human
-    jitter_suspicious: bool  = field(init=False, default=False)
+    state:      TracerState = field(init=False, default=TracerState.INSTRUCTING)
+    template:   ShapeTemplate = field(init=False)
+    similarity: float = field(init=False, default=0.0)   # 0 … 1
+    dtw_cost:   float = field(init=False, default=0.0)
 
     # -- internal ---------------------------------------------------------
     _traced:          list[tuple[float, float]] = field(init=False, default_factory=list)
     _raw_buf:         list[tuple[float, float]] = field(init=False, default_factory=list)
-    _velocities:      list[float] = field(init=False, default_factory=list)  # jitter data
     _draw_start:      Optional[float] = field(init=False, default=None)   # set on TRACING entry
     _position_start:  Optional[float] = field(init=False, default=None)   # set on POSITIONING entry
     _instruct_start:  Optional[float] = field(init=False, default=None)   # set on INSTRUCTING entry
@@ -466,7 +386,7 @@ class ShapeTracerSession:
     # -- Point recording (3-point moving-average smoothing) ---------------
 
     def _push_point(self, x: float, y: float) -> None:
-        """Append smoothed point and record velocity for jitter analysis."""
+        """Append smoothed point; mirrors ShapeRecognizer.push() logic."""
         self._raw_buf.append((x, y))
         if len(self._raw_buf) > 3:
             self._raw_buf.pop(0)
@@ -476,59 +396,30 @@ class ShapeTracerSession:
         # Skip near-duplicates to keep the path compact.
         if self._traced:
             lx, ly = self._traced[-1]
-            dx, dy = sx - lx, sy - ly
-            dist   = math.sqrt(dx * dx + dy * dy)
-            if dist < 0.003:
-                # Still track near-zero velocities for jitter analysis.
-                self._velocities.append(dist)
+            if abs(sx - lx) < 0.003 and abs(sy - ly) < 0.003:
                 return
-            self._velocities.append(dist)
         self._traced.append((sx, sy))
 
     # -- Verification (runs in exactly one frame) -------------------------
 
     def _run_verification(self) -> None:
-        """Compute DTW similarity + jitter check; transition to VERIFIED or FAILED."""
+        """Compute DTW similarity and transition to VERIFIED or FAILED."""
         now = time.time()
         if len(self._traced) < self.template.min_trace_points:
             self.state      = TracerState.FAILED
             self._result_at = now
             return
 
-        # ── DTW shape match ───────────────────────────────────────────
         t_rs   = _resample(list(self.template.waypoints), self.resample_n)
         u_rs   = _resample(self._traced,                  self.resample_n)
         t_norm = _centroid_normalise(t_rs)
         u_norm = _centroid_normalise(u_rs)
 
-        cost          = dtw_normalised_cost(t_norm, u_norm)
-        self.dtw_cost = cost
-
-        # ── Jitter / liveness analysis ────────────────────────────────
-        self.jitter_suspicious, self.jitter_score = _analyse_jitter(self._velocities)
-
-        # Apply jitter penalty: a suspicious trace has similarity halved.
-        raw_similarity = max(0.0, min(1.0, 1.0 - cost / self.dtw_threshold))
-        if self.jitter_suspicious:
-            raw_similarity *= 0.5    # 50 % penalty keeps it visible in HUD
-
-        self.similarity = raw_similarity
-
-        # Verdict: suspicious jitter alone is not an immediate fail — we
-        # require BOTH a high DTW cost AND suspicious jitter to reject.
-        # This avoids penalising naturally tremor-heavy users.
-        dtw_ok     = cost <= self.dtw_threshold
-        jitter_ok  = not self.jitter_suspicious
-        if dtw_ok and jitter_ok:
-            self.state = TracerState.VERIFIED
-        elif dtw_ok and not jitter_ok:
-            # Shape matches but movement looks robotic — reject.
-            self.state = TracerState.FAILED
-        else:
-            # Shape mismatch (jitter status doesn't matter).
-            self.state = TracerState.FAILED
-
-        self._result_at = now
+        cost             = dtw_normalised_cost(t_norm, u_norm)
+        self.dtw_cost    = cost
+        self.similarity  = max(0.0, min(1.0, 1.0 - cost / self.dtw_threshold))
+        self.state       = TracerState.VERIFIED if cost <= self.dtw_threshold else TracerState.FAILED
+        self._result_at  = now
 
     # -- Main update ------------------------------------------------------
 
@@ -557,7 +448,7 @@ class ShapeTracerSession:
                     if (is_finger_open(lm0, hand0.handedness, Finger.INDEX) and
                             _finger_near_point(tip.x, tip.y,
                                                *self.template.start_point,
-                                               START_TRIGGER_RADIUS)):
+                                               START_RADIUS)):
                         self._position_start = now
                         self.state = TracerState.POSITIONING
             return self.state
@@ -596,7 +487,7 @@ class ShapeTracerSession:
         if self.state == TracerState.IDLE:
             if index_open and _finger_near_point(fx, fy,
                                                  *self.template.start_point,
-                                                 START_TRIGGER_RADIUS):
+                                                 START_RADIUS):
                 self._position_start = now
                 self.state = TracerState.POSITIONING
 
@@ -604,7 +495,7 @@ class ShapeTracerSession:
         elif self.state == TracerState.POSITIONING:
             if not index_open or not _finger_near_point(fx, fy,
                                                         *self.template.start_point,
-                                                        START_TRIGGER_RADIUS):
+                                                        START_RADIUS):
                 # Finger left the start zone → back to IDLE.
                 self._position_start = None
                 self.state = TracerState.IDLE
@@ -630,7 +521,7 @@ class ShapeTracerSession:
                 self._push_point(fx, fy)
                 self._was_index_open = True
 
-                # Arm trigger once finger moves beyond ARM_RADIUS from start.
+                # Arm trigger once finger moves away from the start point.
                 if not self._start_armed:
                     if not _finger_near_point(fx, fy,
                                               *self.template.start_point,
@@ -640,7 +531,7 @@ class ShapeTracerSession:
                 # End trigger: finger at end_point AND armed.
                 if self._start_armed and _finger_near_point(fx, fy,
                                                             *self.template.end_point,
-                                                            END_TRIGGER_RADIUS):
+                                                            END_RADIUS):
                     self.state = TracerState.COMPLETED
             else:
                 # Fist after a valid stroke → trigger completion.
@@ -654,7 +545,6 @@ class ShapeTracerSession:
     def _reset_drawing(self) -> None:
         self._traced.clear()
         self._raw_buf.clear()
-        self._velocities.clear()
         self._was_index_open = False
         self._draw_start     = None
 
@@ -705,13 +595,6 @@ class ShapeTracerSession:
         return max(0.0, self.instruction_duration - (time.time() - self._instruct_start))
 
     @property
-    def verified_elapsed(self) -> float:
-        """Seconds since VERIFIED state was entered; -1 if not verified."""
-        if self.state == TracerState.VERIFIED and self._result_at is not None:
-            return time.time() - self._result_at
-        return -1.0
-
-    @property
     def similarity_pct(self) -> float:
         """0 – 100 similarity percentage (only meaningful after COMPLETED)."""
         return self.similarity * 100.0
@@ -722,14 +605,12 @@ class ShapeTracerSession:
 
     def reset(self) -> None:
         """Pick a new random shape and restart from the INSTRUCTING phase."""
-        self.template          = generate_random_shape()
-        self.state             = TracerState.INSTRUCTING
-        self.similarity        = 0.0
-        self.dtw_cost          = 0.0
-        self.jitter_score      = 0.5
-        self.jitter_suspicious = False
-        self._instruct_start   = time.time()
-        self._result_at        = None
-        self._position_start   = None
-        self._start_armed      = False
+        self.template        = generate_random_shape()
+        self.state           = TracerState.INSTRUCTING
+        self.similarity      = 0.0
+        self.dtw_cost        = 0.0
+        self._instruct_start = time.time()
+        self._result_at      = None
+        self._position_start = None
+        self._start_armed    = False
         self._reset_drawing()

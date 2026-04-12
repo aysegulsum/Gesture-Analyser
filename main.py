@@ -501,34 +501,23 @@ def _draw_shape_template(frame, template, w: int, h: int,
     ex = int(template.end_point[0]   * w)
     ey = int(template.end_point[1]   * h)
 
-    # Compute trigger zone radii in pixels for the visual hint ring.
-    # These are LARGER than the visual dot to show users the generous hit zone.
-    from shape_tracer import START_TRIGGER_RADIUS, END_TRIGGER_RADIUS
-    # Use the average frame dimension as a scale reference.
-    scale_px   = (w + h) / 2
-    s_trig_px  = int(START_TRIGGER_RADIUS * scale_px)   # e.g. ~44 px at 480p
-    e_trig_px  = int(END_TRIGGER_RADIUS   * scale_px)
-
     if tracer_state in (TS.INSTRUCTING, TS.IDLE):
-        # Faint dashed-style trigger zone ring.
-        cv2.circle(frame, (sx, sy), s_trig_px, (0, 80, 0), 1, cv2.LINE_AA)
-        # Pulsing solid inner ring — faster during IDLE.
+        # Pulsing ring — faster during IDLE to draw attention.
         speed  = 3.0 if tracer_state == TS.INSTRUCTING else 5.0
         pulse  = 0.5 + 0.5 * math.sin(time.time() * speed)
         r_out  = int(12 + 8 * pulse)
         cv2.circle(frame, (sx, sy), r_out, GREEN, 2, lineType=cv2.LINE_AA)
         cv2.circle(frame, (sx, sy),      8, GREEN, -1)
-        # END marker for open shapes — also show its trigger zone.
+        cv2.putText(frame, "START", (sx + 14, sy + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, GREEN, 1, cv2.LINE_AA)
+        # Also show end point on open shapes so users can plan the route.
         if (ex, ey) != (sx, sy):
-            cv2.circle(frame, (ex, ey), e_trig_px, (80, 0, 0), 1, cv2.LINE_AA)
             cv2.circle(frame, (ex, ey), 8, RED, -1)
+            cv2.putText(frame, "END", (ex + 12, ey + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, RED, 1, cv2.LINE_AA)
 
     elif tracer_state == TS.POSITIONING:
-        # Trigger zone hint fades as arc fills.
-        alpha_ring = max(0, 1.0 - position_progress * 2)
-        if alpha_ring > 0.1:
-            cv2.circle(frame, (sx, sy), s_trig_px, (0, 80, 0), 1, cv2.LINE_AA)
-        # Solid inner dot + arc-fill progress ring.
+        # Arc-fill ring showing hold progress.
         cv2.circle(frame, (sx, sy), 8, GREEN, -1)
         angle = int(position_progress * 360)
         cv2.ellipse(frame, (sx, sy), (20, 20), -90, 0, angle,
@@ -536,73 +525,66 @@ def _draw_shape_template(frame, template, w: int, h: int,
         cv2.circle(frame, (sx, sy), 20, (100, 220, 100), 1, lineType=cv2.LINE_AA)
 
     elif tracer_state == TS.TRACING:
-        # Solid green start dot (no label — keeps canvas clear).
+        # Solid green start dot (no label — keeps canvas clean).
         cv2.circle(frame, (sx, sy), 9, GREEN, -1)
-        # Orange end marker + trigger zone for open shapes.
+        # Orange end marker for open shapes only.
         if (ex, ey) != (sx, sy):
-            cv2.circle(frame, (ex, ey), e_trig_px, (0, 80, 120), 1, cv2.LINE_AA)
             cv2.circle(frame, (ex, ey), 9, ORANGE, -1)
+            cv2.putText(frame, "END", (ex + 12, ey + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, ORANGE, 1, cv2.LINE_AA)
 
     else:
-        # COMPLETED / result states — plain dot only.
+        # COMPLETED / result states — plain dot.
         cv2.circle(frame, (sx, sy), 9, GREEN, -1)
 
 
-# ── Shape HUD panel ──────────────────────────────────────────────────────
-#
-# Layout contract: shapes occupy roughly y ∈ [0.22h, 0.75h] and
-# x ∈ [0.20w, 0.80w] of the frame.  The HUD panel is pinned to the
-# BOTTOM-LEFT of the frame, starting at y = int(h * 0.80) so it sits
-# BELOW the shape canvas on every supported resolution.
-#
-# Maximum content: 3 text lines + 1 progress bar  ≈ 95 px tall.
-# This fits within the 20 % bottom strip for 480 p and above.
-
-_HUD_TOP_FRAC = 0.80      # panel starts at this fraction of frame height
-_HUD_LINE_H   = 24        # pixels per text line
-_HUD_PAD_X    = 12        # horizontal padding inside panel
-_HUD_PAD_Y    = 8         # vertical padding
-_HUD_BAR_H    = 7         # inline progress bar height
-_HUD_PW_MAX   = 380       # maximum panel width
-
+# ── Shape info panel (top-left, clears the centre canvas) ────────────────
 
 def _draw_shape_info_panel(frame, st, label: str, w: int, h: int) -> None:
-    """Render all shape-tracing status text in a bottom-left HUD panel.
+    """Render all shape-tracing status text in a semi-transparent top-left panel.
 
-    The panel is anchored BELOW the shape canvas (y ≥ 80 % of frame height)
-    so the central drawing area is NEVER obscured by text.
+    The centre of the frame is kept clear for the shape and the finger path.
+    Each TracerState gets a tailored message set with an inline progress bar.
     """
     from shape_tracer import TracerState as TS
 
-    FONT = cv2.FONT_HERSHEY_SIMPLEX
+    FONT    = cv2.FONT_HERSHEY_SIMPLEX
+    PAD_X   = 10
+    PAD_Y   = 8
+    LINE_H  = 23
+    PX, PY  = 12, 108   # panel origin (below challenge-progress + score rows)
+    PW      = 335        # panel width
 
-    # ── 1. Build content (max 3 lines + optional bar) ─────────────────
-    lines: list[tuple[str, tuple]] = []
-    bar_progress: float | None = None
-    bar_color = WHITE
+    # ── Build line list ───────────────────────────────────────────────
+    lines: list[tuple[str, tuple]] = []   # (text, bgr_colour)
 
     if st.state == TS.INSTRUCTING:
         rem = st.instruct_remaining
         lines = [
-            (f"TRACE  {label}",                         CYAN),
-            ("Point index finger at the START dot.",    WHITE),
-            (f"Auto-starts in  {rem:.1f} s",            YELLOW),
+            (label,                              CYAN),
+            ("Position index finger over",       WHITE),
+            ("the green  START  point,",         WHITE),
+            ("then hold to begin tracing.",      WHITE),
+            (f"Auto-starts in  {rem:.1f} s ...", YELLOW),
         ]
         bar_progress = st.instruct_progress
         bar_color    = YELLOW
 
     elif st.state == TS.IDLE:
         lines = [
-            (f"{label}",                                CYAN),
-            ("Point index finger at the",               WHITE),
-            ("pulsing green  START  dot.",              WHITE),
+            (label,                              CYAN),
+            ("Hover index finger over",          WHITE),
+            ("the pulsing green START point.",   WHITE),
         ]
+        bar_progress = None
+        bar_color    = None
 
     elif st.state == TS.POSITIONING:
         pct = int(st.position_progress * 100)
         lines = [
-            (f"{label}",                                CYAN),
-            (f"Hold steady at START...  {pct} %",       GREEN),
+            (label,                              CYAN),
+            (f"Hold steady...  {pct}%",          GREEN),
+            ("Keep finger on START point.",      WHITE),
         ]
         bar_progress = st.position_progress
         bar_color    = GREEN
@@ -611,148 +593,64 @@ def _draw_shape_info_panel(frame, st, label: str, w: int, h: int) -> None:
         rem   = st.time_remaining
         t_col = RED if rem < 2 else YELLOW if rem < 4 else GREEN
         lines = [
-            (f"RECORDING  {label}",                     RED),
-            (f"{st.point_count} pts  |  {rem:.1f} s left", t_col),
-            ("Reach END dot, or close fist to stop.",   WHITE),
+            (f"  RECORDING  {label}",            RED),
+            (f"{st.point_count} points  |  {rem:.1f} s left", t_col),
+            ("Reach END point, or close fist.",  WHITE),
         ]
-        bar_progress = 1.0 - st.draw_progress
+        bar_progress = 1.0 - st.draw_progress   # remaining fraction
         bar_color    = t_col
 
     elif st.state == TS.COMPLETED:
         lines = [
-            (f"{label}",                                CYAN),
-            ("Analysing trace...",                      YELLOW),
+            (label,                              CYAN),
+            ("Analysing trace...",               YELLOW),
         ]
+        bar_progress = None
+        bar_color    = None
 
     else:
-        return   # VERIFIED / FAILED handled by the liveness SUCCESS/FAILED block
+        return   # VERIFIED / FAILED handled by the liveness state block
 
     if not lines:
         return
 
-    # ── 2. Compute geometry ───────────────────────────────────────────
-    n_lines  = len(lines)
     has_bar  = bar_progress is not None
-    panel_h  = n_lines * _HUD_LINE_H + 2 * _HUD_PAD_Y + (_HUD_BAR_H + 4 if has_bar else 0)
-    PW       = min(_HUD_PW_MAX, w - 16)
-    PX       = 8
-    # Anchor to bottom strip, guaranteed below the shape canvas.
-    PY       = max(int(h * _HUD_TOP_FRAC), h - panel_h - 56)
+    panel_h  = len(lines) * LINE_H + 2 * PAD_Y + (8 if has_bar else 0)
 
-    # ── 3. Solid dark background (no alpha — guarantees opacity) ──────
-    cv2.rectangle(frame, (PX - 2, PY - 2), (PX + PW + 2, PY + panel_h + 2),
-                  (8, 8, 8), -1)
-    # Coloured left accent stripe.
-    accent = (GREEN   if st.state in (TS.IDLE, TS.POSITIONING) else
-              RED     if st.state == TS.TRACING                else
-              CYAN)
-    cv2.rectangle(frame, (PX, PY), (PX + 4, PY + panel_h), accent, -1)
+    # ── Semi-transparent dark background ─────────────────────────────
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (PX, PY), (PX + PW, PY + panel_h), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
+
+    # Coloured left accent bar.
+    accent = GREEN if st.state in (TS.POSITIONING, TS.IDLE) else \
+             RED   if st.state == TS.TRACING               else CYAN
+    cv2.rectangle(frame, (PX, PY), (PX + 3, PY + panel_h), accent, -1)
+
     # Thin border.
-    cv2.rectangle(frame, (PX, PY), (PX + PW, PY + panel_h), (90, 90, 90), 1)
+    cv2.rectangle(frame, (PX, PY), (PX + PW, PY + panel_h), (80, 80, 80), 1)
 
-    # ── 4. Text lines ─────────────────────────────────────────────────
-    blink_rec = (st.state == TS.TRACING and int(time.time() * 2) % 2 == 0)
+    # ── Text lines ────────────────────────────────────────────────────
+    # Blinking red dot for TRACING state.
+    show_blink_dot = (st.state == TS.TRACING and int(time.time() * 2) % 2 == 0)
+
     for i, (text, color) in enumerate(lines):
-        ty = PY + _HUD_PAD_Y + (i + 1) * _HUD_LINE_H - 5
-        tx = PX + _HUD_PAD_X
-        if i == 0 and blink_rec:
-            cv2.circle(frame, (tx + 5, ty - 7), 5, RED, -1)   # REC dot
-            tx += 16
+        ty = PY + PAD_Y + (i + 1) * LINE_H - 5
+        if i == 0 and show_blink_dot:
+            # Draw blinking record indicator on line 0.
+            cv2.circle(frame, (PX + PAD_X + 5, ty - 7), 5, RED, -1)
+        tx = PX + PAD_X + (16 if (i == 0 and show_blink_dot) else 0)
         cv2.putText(frame, text, (tx, ty), FONT, 0.48, color, 1, cv2.LINE_AA)
 
-    # ── 5. Progress bar ───────────────────────────────────────────────
+    # ── Inline progress bar ───────────────────────────────────────────
     if has_bar:
-        bx1    = PX + _HUD_PAD_X
-        bx2    = PX + PW - _HUD_PAD_X
-        by     = PY + panel_h - _HUD_PAD_Y
+        bx1 = PX + PAD_X
+        bx2 = PX + PW - PAD_X
+        by  = PY + panel_h - PAD_Y
         filled = int((bx2 - bx1) * max(0.0, min(1.0, bar_progress)))
-        cv2.rectangle(frame, (bx1, by - _HUD_BAR_H), (bx2, by), (45, 45, 45), -1)
+        cv2.rectangle(frame, (bx1, by - 4), (bx2, by), (50, 50, 50), -1)
         if filled > 0:
-            cv2.rectangle(frame, (bx1, by - _HUD_BAR_H),
-                          (bx1 + filled, by), bar_color, -1)
-
-
-# ── Result panel (bottom-left) — shown on SUCCESS / FAILED ───────────────
-
-def _draw_shape_result_panel(frame, st, w: int, h: int) -> None:
-    """Show similarity, DTW, and jitter scores after a trace attempt."""
-    FONT  = cv2.FONT_HERSHEY_SIMPLEX
-    pct   = st.similarity_pct
-    s_col = GREEN if pct >= 70 else YELLOW if pct >= 40 else RED
-    j_col = GREEN if not st.jitter_suspicious else RED
-
-    lines = [
-        (f"Similarity  {pct:.0f} %   DTW {st.dtw_cost:.3f}", s_col),
-        (f"Jitter score  {st.jitter_score:.2f}"
-         + ("  (suspicious)" if st.jitter_suspicious else "  (human-like)"), j_col),
-    ]
-
-    PW     = min(380, w - 16)
-    PX, PY = 8, int(h * _HUD_TOP_FRAC)
-    panel_h = len(lines) * _HUD_LINE_H + 2 * _HUD_PAD_Y
-
-    cv2.rectangle(frame, (PX - 2, PY - 2), (PX + PW + 2, PY + panel_h + 2),
-                  (8, 8, 8), -1)
-    cv2.rectangle(frame, (PX, PY), (PX + 4, PY + panel_h), s_col, -1)
-    cv2.rectangle(frame, (PX, PY), (PX + PW, PY + panel_h), (90, 90, 90), 1)
-    for i, (text, color) in enumerate(lines):
-        ty = PY + _HUD_PAD_Y + (i + 1) * _HUD_LINE_H - 5
-        cv2.putText(frame, text, (PX + _HUD_PAD_X, ty), FONT, 0.48, color, 1, cv2.LINE_AA)
-
-
-def _draw_verified_glow(frame, template, w: int, h: int, elapsed: float) -> None:
-    """Flash the template shape in bright green when the trace is verified.
-
-    Plays for the first 1.5 seconds after VERIFIED state is entered:
-      • 0.0 – 0.6 s : shape brightens rapidly (green flash)
-      • 0.6 – 1.5 s : shape pulses and fades back to normal
-      • Checkmark drawn at centre (scales in over the first 0.5 s)
-    """
-    if elapsed < 0 or elapsed > 1.8:
-        return
-
-    waypoints = list(template.waypoints)
-    if len(waypoints) < 2:
-        return
-
-    pts = [(int(x * w), int(y * h)) for x, y in waypoints]
-
-    # Brightness envelope: quick rise, then exponential decay.
-    if elapsed < 0.3:
-        intensity = elapsed / 0.3          # 0 → 1
-    else:
-        intensity = math.exp(-(elapsed - 0.3) * 2.5)  # 1 → 0
-
-    # Pulse on top of the decay.
-    pulse     = 0.5 + 0.5 * math.sin(elapsed * 18.0)
-    glow_br   = int(80 + 175 * intensity * pulse)
-    glow_col  = (0, glow_br, int(glow_br * 0.35))   # bright green tint
-
-    # Draw stacked lines of decreasing thickness for a glow halo.
-    for extra in [8, 5, 2, 0]:
-        alpha = 0.12 if extra > 0 else 0.5 * intensity
-        if alpha < 0.01:
-            continue
-        ov = frame.copy()
-        for i in range(1, len(pts)):
-            cv2.line(ov, pts[i - 1], pts[i], glow_col,
-                     3 + extra, lineType=cv2.LINE_AA)
-        cv2.addWeighted(ov, alpha, frame, 1.0 - alpha, 0, frame)
-
-    # Checkmark: scales in over 0 – 0.5 s at the shape's centre.
-    if elapsed < 1.2:
-        cx = int(sum(p[0] for p in waypoints) / len(waypoints) * w)
-        cy = int(sum(p[1] for p in waypoints) / len(waypoints) * h)
-        scale = min(1.0, elapsed / 0.4)
-        cs    = int(28 * scale)
-        if cs >= 5:
-            p1 = (cx - cs,       cy)
-            p2 = (cx - cs // 3,  cy + cs // 2)
-            p3 = (cx + cs,       cy - cs // 2)
-            cv2.polylines(frame,
-                          [np.array([p1, p2, p3], dtype=np.int32)],
-                          False, (0, 255, 90), max(2, int(3 * scale)),
-                          cv2.LINE_AA)
+            cv2.rectangle(frame, (bx1, by - 4), (bx1 + filled, by), bar_color, -1)
 
 
 def _draw_traced_path(frame, traced, w: int, h: int) -> None:
@@ -799,9 +697,6 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
                              position_progress=st.position_progress)
         if st.state in (TracerState.TRACING, TracerState.VERIFIED, TracerState.FAILED):
             _draw_traced_path(frame, st.traced_path, w, h)
-        # Success glow animation (runs for ~1.8 s after VERIFIED).
-        if st.state == TracerState.VERIFIED:
-            _draw_verified_glow(frame, st.template, w, h, st.verified_elapsed)
 
     # -- Verification score bar (top) -------------------------------------
     _draw_verification_bar(frame, lv.verification_pct, y=10)
@@ -841,17 +736,25 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
     if ls == LivenessState.SUCCESS:
         if lv.is_drawing_cmd:
             _draw_air_canvas(frame, lv.drawing_path, w, h)
-        # Large centred verdict — safe because shape+trace are frozen now.
         put_text_centered(frame, "VERIFIED!", h // 2 - 20,
                           font_scale=1.4, color=GREEN, thickness=3)
         if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
-            # Result metrics → bottom HUD panel, never over the canvas.
-            _draw_shape_result_panel(frame, lv.shape_tracer, w, h)
+            pct     = lv.shape_tracer.similarity_pct
+            s_color = GREEN if pct >= 70 else YELLOW if pct >= 40 else RED
+            # Result detail → top-left, not centre.
+            put_text_with_bg(frame,
+                             f"Similarity: {pct:.0f}%  DTW: {lv.shape_tracer.dtw_cost:.3f}",
+                             (12, 108), font_scale=0.55, color=s_color)
     elif ls == LivenessState.FAILED:
         put_text_centered(frame, "FAILED!", h // 2 - 20,
                           font_scale=1.4, color=RED, thickness=3)
         if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
-            _draw_shape_result_panel(frame, lv.shape_tracer, w, h)
+            pct = lv.shape_tracer.similarity_pct
+            put_text_with_bg(frame,
+                             f"Similarity: {pct:.0f}%  (need DTW <= 0.25)",
+                             (12, 108), font_scale=0.55, color=YELLOW)
+            put_text_with_bg(frame, "Next challenge incoming...",
+                             (12, 132), font_scale=0.52, color=YELLOW)
         else:
             put_text_centered(frame, "Next challenge incoming...",
                               h // 2 + 55, font_scale=0.7, color=YELLOW)

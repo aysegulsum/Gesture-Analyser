@@ -34,6 +34,7 @@ from gesture_validator import GestureValidator, depth_proxy, is_finger_open, Fin
 from motion_analyzer import WaveDetector, ShapeRecognizer
 from anti_spoof import AntiSpoofAnalyzer, SpoofResult
 from finger_touch_detector import FingerTouchDetector, TouchCommand
+from shape_tracer import ShapeTracerSession, TracerState, DEFAULT_DRAW_TIME
 
 
 # ── Command definitions ─────────────────────────────────────────────
@@ -49,6 +50,7 @@ class CmdType(Enum):
     HAND_FLIP = auto()
     PEEK_A_BOO = auto()
     FINGER_TOUCH = auto()  # validated touch with Z-axis check + 10-frame hold
+    SHAPE_TRACE  = auto()  # dynamic shape tracing with DTW verification
 
 
 @dataclass(frozen=True)
@@ -113,7 +115,13 @@ _TOUCH_CMDS = [
             extra={"touch_cmd": TouchCommand.DOUBLE_THUMB_TOUCH}),
 ]
 
-ALL_COMMANDS = _GESTURE_CMDS + _SPATIAL_CMDS + _MOTION_CMDS + _ADVANCED_CMDS + _TOUCH_CMDS
+# ── Shape Tracing commands (DTW-verified, depth-gated) ───────────────
+
+_SHAPE_CMDS = [
+    Command("TRACE THE SHAPE!",  CmdType.SHAPE_TRACE),
+]
+
+ALL_COMMANDS = _GESTURE_CMDS + _SPATIAL_CMDS + _MOTION_CMDS + _ADVANCED_CMDS + _TOUCH_CMDS + _SHAPE_CMDS
 
 # Number of challenges to complete for 100% verification.
 CHALLENGES_FOR_FULL_SCORE = 5
@@ -196,6 +204,9 @@ class LivenessChallenge:
     # Finger touch state (FINGER_TOUCH commands)
     _touch_detector: Optional[FingerTouchDetector] = field(init=False, default=None)
 
+    # Shape tracing state (SHAPE_TRACE commands)
+    _shape_tracer: Optional[ShapeTracerSession] = field(init=False, default=None)
+
     def __post_init__(self):
         self._validator = GestureValidator(smoothing_window=self.smoothing_window)
         self._wave = WaveDetector(buffer_size=40, min_swing=0.10,
@@ -245,6 +256,15 @@ class LivenessChallenge:
         else:
             self._touch_detector = None
 
+        # Create a fresh shape tracer for SHAPE_TRACE challenges.
+        if self.current_cmd.cmd_type == CmdType.SHAPE_TRACE:
+            self._shape_tracer = ShapeTracerSession(
+                time_limit=DEFAULT_DRAW_TIME,
+                dtw_threshold=0.25,
+            )
+        else:
+            self._shape_tracer = None
+
     @property
     def _effective_time_limit(self) -> float:
         ct = self.current_cmd.cmd_type
@@ -254,6 +274,12 @@ class LivenessChallenge:
             return self.time_limit + 2.0
         if ct == CmdType.FINGER_TOUCH:
             return self.time_limit + 1.0
+        if ct == CmdType.SHAPE_TRACE:
+            # With the Point-to-Point Trigger the user spends an unknown
+            # amount of time in IDLE / POSITIONING before TRACING begins.
+            # Give the liveness wrapper a very wide safety-net (2 min) so
+            # it never fires before the tracer's own TRACING timer runs out.
+            return self.time_limit + DEFAULT_DRAW_TIME + 120.0
         return self.time_limit
 
     @property
@@ -451,6 +477,19 @@ class LivenessChallenge:
                 self._succeed(now)
                 return self.state
 
+        # Shape tracing (DTW-verified, depth-gated).
+        if ct == CmdType.SHAPE_TRACE and self._shape_tracer is not None:
+            tracer_state = self._shape_tracer.update(hands)
+            if tracer_state == TracerState.VERIFIED:
+                self._succeed(now)
+                return self.state
+            if tracer_state == TracerState.FAILED:
+                self.state       = LivenessState.FAILED
+                self._result_at  = now
+                self.streak      = 0
+                return self.state
+            return self.state   # tracer managing its own sub-states; skip other logic
+
         # Hand flip.
         if ct == CmdType.HAND_FLIP:
             if self._hand_flip_check(hands):
@@ -586,6 +625,24 @@ class LivenessChallenge:
         if self._touch_detector is None:
             return 0.0
         return self._touch_detector.progress
+
+    # -- Shape tracer display helpers ------------------------------------
+
+    @property
+    def is_shape_trace_cmd(self) -> bool:
+        return self.current_cmd.cmd_type == CmdType.SHAPE_TRACE
+
+    @property
+    def shape_tracer(self) -> Optional[ShapeTracerSession]:
+        """Direct access to the active ShapeTracerSession for the HUD."""
+        return self._shape_tracer
+
+    @property
+    def shape_trace_label(self) -> str:
+        """Readable command label including the shape name chosen for this round."""
+        if self._shape_tracer is None:
+            return "TRACE THE SHAPE!"
+        return f"TRACE THE {self._shape_tracer.template.label}!"
 
     @property
     def challenge_progress_text(self) -> str:

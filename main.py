@@ -21,6 +21,7 @@ GameManager   -- owns all game sessions, handles mode switching and the
 main loop     -- capture + render only; no game logic here.
 """
 
+import math
 import time
 
 import cv2
@@ -31,8 +32,11 @@ from gesture_session import GestureSession, SessionState
 from math_session import MathSession, MathState
 from simon_session import SimonSaysGame, SimonState
 from liveness_session import LivenessChallenge, LivenessState, CmdType
+from shape_tracer import TracerState
 from sequential_session import SequentialSession, SeqState, StepResult
 from finger_touch_session import FingerTouchSession, TouchTestState
+from tracing_evaluator import TracingEvaluator
+from shape_trace_eval_session import ShapeTraceEvalSession, EvalMode, _EvalState
 
 
 # -- colour palette -------------------------------------------------------
@@ -45,7 +49,7 @@ MAGENTA = (200, 50, 255)
 ORANGE = (0, 160, 255)
 DARK_BG = (40, 40, 40)
 
-MODE_NAMES = ["Normal", "Math", "Simon", "Liveness", "Sequential", "Touch Test"]
+MODE_NAMES = ["Normal", "Math", "Simon", "Liveness", "Sequential", "Touch Test", "Shape Eval"]
 
 
 # ── GameManager ─────────────────────────────────────────────────────
@@ -84,6 +88,13 @@ class GameManager:
         self.touch_test = FingerTouchSession(
             verify_frames=10, pause_after_success=1.5,
         )
+        _evaluator = TracingEvaluator(log_dir="eval_logs")
+        self.shape_eval = ShapeTraceEvalSession(
+            evaluator=_evaluator,
+            eval_mode=EvalMode.HUMAN_TEST,
+            dtw_threshold=0.25,
+            auto_advance=True,
+        )
 
         self.hands_present = False
 
@@ -103,6 +114,8 @@ class GameManager:
             self.sequential.reset()
         elif self.current_mode == 5:
             self.touch_test.reset()
+        elif self.current_mode == 6:
+            self.shape_eval.reset()
 
     def restart(self):
         if self.current_mode == 0:
@@ -117,6 +130,8 @@ class GameManager:
             self.sequential.reset()
         elif self.current_mode == 5:
             self.touch_test.reset()
+        elif self.current_mode == 6:
+            self.shape_eval.reset()
 
     def update(self, hands: list[HandResult]):
         """Global hand-presence check, then delegate to active mode.
@@ -141,6 +156,8 @@ class GameManager:
             self.sequential.update(hands)
         elif self.current_mode == 5:
             self.touch_test.update(hands)
+        elif self.current_mode == 6:
+            self.shape_eval.update(hands)
 
 
 # ── Drawing utilities ───────────────────────────────────────────────
@@ -339,6 +356,325 @@ def _draw_verification_bar(frame, pct, y=55):
     cv2.putText(frame, label, (x_start + (bar_w - tw) // 2, y + 17), font, 0.55, WHITE, 1)
 
 
+def _draw_direction_arrows(frame, pts: list, color) -> None:
+    """Draw small filled triangle arrows along a polyline every ~65 screen pixels.
+
+    Arrows point in the direction of motion, giving users an immediate cue
+    about which way to trace the shape.  This is the primary 'Bonus Feature'.
+    """
+    if len(pts) < 3:
+        return
+    # Arc-length accumulator in pixel space.
+    arc = [0.0]
+    for i in range(1, len(pts)):
+        dx = pts[i][0] - pts[i - 1][0]
+        dy = pts[i][1] - pts[i - 1][1]
+        arc.append(arc[-1] + math.sqrt(dx * dx + dy * dy))
+    total = arc[-1]
+    if total < 80:
+        return
+
+    spacing   = 65.0          # pixels between consecutive arrows
+    first_pos = spacing * 1.5  # first arrow well away from the start marker
+    target    = first_pos
+    j         = 0
+    while target < total - spacing * 0.8:
+        while j < len(arc) - 2 and arc[j + 1] < target:
+            j += 1
+        seg  = arc[j + 1] - arc[j]
+        frac = (target - arc[j]) / seg if seg > 1e-6 else 0.0
+        ax   = pts[j][0] + frac * (pts[j + 1][0] - pts[j][0])
+        ay   = pts[j][1] + frac * (pts[j + 1][1] - pts[j][1])
+        # Direction: look a short distance ahead in pixel space.
+        ahead_idx = min(j + max(1, len(pts) // 20), len(pts) - 1)
+        dx = pts[ahead_idx][0] - pts[j][0]
+        dy = pts[ahead_idx][1] - pts[j][1]
+        mag = math.sqrt(dx * dx + dy * dy)
+        if mag > 1e-6:
+            dx /= mag; dy /= mag
+            px, py_v = -dy, dx          # perpendicular
+            tip   = (int(ax + dx * 9),                    int(ay + dy * 9))
+            base1 = (int(ax - dx * 5 + px   * 5),         int(ay - dy * 5 + py_v * 5))
+            base2 = (int(ax - dx * 5 - px   * 5),         int(ay - dy * 5 - py_v * 5))
+            cv2.fillPoly(frame,
+                         [np.array([tip, base1, base2], dtype=np.int32)],
+                         color)
+        target += spacing
+
+
+def _draw_ghost_trace(frame, waypoints: list, w: int, h: int) -> None:
+    """Animate a glowing ghost dot cycling along the template path.
+
+    Cycles once every 3 seconds, showing users the expected drawing
+    direction and pace before they begin.  Draws a short comet-tail
+    of fading circles behind the head.
+    """
+    if len(waypoints) < 2:
+        return
+
+    PERIOD     = 3.0
+    TRAIL_FRAC = 0.07   # fraction of total arc shown as trail
+    TRAIL_N    = 6      # number of trail dots
+
+    # Arc-length parameterisation.
+    dists = [0.0]
+    for i in range(1, len(waypoints)):
+        dx = waypoints[i][0] - waypoints[i - 1][0]
+        dy = waypoints[i][1] - waypoints[i - 1][1]
+        dists.append(dists[-1] + math.sqrt(dx * dx + dy * dy))
+    total = dists[-1]
+    if total < 1e-9:
+        return
+
+    def _interp(frac: float) -> tuple[int, int]:
+        """Return pixel position for a given arc-fraction (0-1, wrapping)."""
+        target = (frac % 1.0) * total
+        k = 0
+        while k < len(dists) - 2 and dists[k + 1] < target:
+            k += 1
+        seg = dists[k + 1] - dists[k]
+        s   = (target - dists[k]) / seg if seg > 1e-9 else 0.0
+        x   = waypoints[k][0] + s * (waypoints[k + 1][0] - waypoints[k][0])
+        y   = waypoints[k][1] + s * (waypoints[k + 1][1] - waypoints[k][1])
+        return (int(x * w), int(y * h))
+
+    now_frac = (time.time() % PERIOD) / PERIOD
+
+    # Draw comet tail first (drawn before head so head sits on top).
+    for i in range(TRAIL_N, 0, -1):
+        f       = now_frac - (i / TRAIL_N) * TRAIL_FRAC
+        pos     = _interp(f)
+        alpha   = i / TRAIL_N           # 0 = oldest (faintest), 1 = newest
+        gray    = int(60 + 100 * alpha)
+        radius  = int(3 + 3 * alpha)
+        cv2.circle(frame, pos, radius, (gray, gray, gray + 40), -1, cv2.LINE_AA)
+
+    # Bright ghost head.
+    head = _interp(now_frac)
+    cv2.circle(frame, head, 9,  (220, 240, 255), -1, cv2.LINE_AA)  # pale blue-white fill
+    cv2.circle(frame, head, 9,  (255, 255, 255),  2, cv2.LINE_AA)  # white ring
+    cv2.circle(frame, head, 13, (180, 200, 220),  1, cv2.LINE_AA)  # faint outer glow
+
+
+def _draw_shape_template(frame, template, w: int, h: int,
+                         tracer_state=None,
+                         position_progress: float = 0.0) -> None:
+    """Draw the target shape guide with state-adaptive visual cues.
+
+    Layers (back → front):
+      1. Ghost trace animation     (INSTRUCTING / IDLE only)
+      2. Semi-transparent template overlay
+      3. Solid template lines
+      4. Directional arrows        (always, shows drawing direction)
+      5. Start / End point markers (state-specific style)
+    """
+    from shape_tracer import TracerState as TS
+
+    waypoints = list(template.waypoints)
+    if len(waypoints) < 2:
+        return
+
+    pts = [(int(x * w), int(y * h)) for x, y in waypoints]
+
+    # ── 1. Ghost trace (INSTRUCTING / IDLE) ──────────────────────────
+    if tracer_state in (TS.INSTRUCTING, TS.IDLE):
+        _draw_ghost_trace(frame, waypoints, w, h)
+
+    # ── 2. Semi-transparent template overlay ─────────────────────────
+    overlay = frame.copy()
+    for i in range(1, len(pts)):
+        cv2.line(overlay, pts[i - 1], pts[i], (200, 200, 200), 3, lineType=cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    # ── 3. Solid template lines ───────────────────────────────────────
+    for i in range(1, len(pts)):
+        cv2.line(frame, pts[i - 1], pts[i], (200, 200, 200), 2, lineType=cv2.LINE_AA)
+
+    # ── 4. Directional arrows ─────────────────────────────────────────
+    # Arrow colour: dim white in guide states, bright white during TRACING.
+    arrow_col = (160, 160, 160) if tracer_state != TS.TRACING else (220, 220, 220)
+    _draw_direction_arrows(frame, pts, arrow_col)
+
+    # ── 5. Start / End point markers ─────────────────────────────────
+    sx = int(template.start_point[0] * w)
+    sy = int(template.start_point[1] * h)
+    ex = int(template.end_point[0]   * w)
+    ey = int(template.end_point[1]   * h)
+
+    if tracer_state in (TS.INSTRUCTING, TS.IDLE):
+        # Pulsing ring — faster during IDLE to draw attention.
+        speed  = 3.0 if tracer_state == TS.INSTRUCTING else 5.0
+        pulse  = 0.5 + 0.5 * math.sin(time.time() * speed)
+        r_out  = int(12 + 8 * pulse)
+        cv2.circle(frame, (sx, sy), r_out, GREEN, 2, lineType=cv2.LINE_AA)
+        cv2.circle(frame, (sx, sy),      8, GREEN, -1)
+        cv2.putText(frame, "START", (sx + 14, sy + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, GREEN, 1, cv2.LINE_AA)
+        # Also show end point on open shapes so users can plan the route.
+        if (ex, ey) != (sx, sy):
+            cv2.circle(frame, (ex, ey), 8, RED, -1)
+            cv2.putText(frame, "END", (ex + 12, ey + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, RED, 1, cv2.LINE_AA)
+
+    elif tracer_state == TS.POSITIONING:
+        # Arc-fill ring showing hold progress.
+        cv2.circle(frame, (sx, sy), 8, GREEN, -1)
+        angle = int(position_progress * 360)
+        cv2.ellipse(frame, (sx, sy), (20, 20), -90, 0, angle,
+                    GREEN, 3, lineType=cv2.LINE_AA)
+        cv2.circle(frame, (sx, sy), 20, (100, 220, 100), 1, lineType=cv2.LINE_AA)
+
+    elif tracer_state == TS.TRACING:
+        # Solid green start dot (no label — keeps canvas clean).
+        cv2.circle(frame, (sx, sy), 9, GREEN, -1)
+        # Orange end marker for open shapes only.
+        if (ex, ey) != (sx, sy):
+            cv2.circle(frame, (ex, ey), 9, ORANGE, -1)
+            cv2.putText(frame, "END", (ex + 12, ey + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, ORANGE, 1, cv2.LINE_AA)
+
+    else:
+        # COMPLETED / result states — plain dot.
+        cv2.circle(frame, (sx, sy), 9, GREEN, -1)
+
+
+# ── Shape info panel (top-left, clears the centre canvas) ────────────────
+
+def _draw_shape_info_panel(frame, st, label: str, w: int, h: int) -> None:
+    """Render all shape-tracing status text in a semi-transparent top-left panel.
+
+    The centre of the frame is kept clear for the shape and the finger path.
+    Each TracerState gets a tailored message set with an inline progress bar.
+    """
+    from shape_tracer import TracerState as TS
+
+    FONT    = cv2.FONT_HERSHEY_SIMPLEX
+    PAD_X   = 10
+    PAD_Y   = 8
+    LINE_H  = 23
+    PX, PY  = 12, 108   # panel origin (below challenge-progress + score rows)
+    PW      = 335        # panel width
+
+    # ── Build line list ───────────────────────────────────────────────
+    lines: list[tuple[str, tuple]] = []   # (text, bgr_colour)
+
+    if st.state == TS.INSTRUCTING:
+        rem = st.instruct_remaining
+        lines = [
+            (label,                              CYAN),
+            ("Position index finger over",       WHITE),
+            ("the green  START  point,",         WHITE),
+            ("then hold to begin tracing.",      WHITE),
+            (f"Auto-starts in  {rem:.1f} s ...", YELLOW),
+        ]
+        bar_progress = st.instruct_progress
+        bar_color    = YELLOW
+
+    elif st.state == TS.IDLE:
+        lines = [
+            (label,                              CYAN),
+            ("Hover index finger over",          WHITE),
+            ("the pulsing green START point.",   WHITE),
+        ]
+        bar_progress = None
+        bar_color    = None
+
+    elif st.state == TS.POSITIONING:
+        pct = int(st.position_progress * 100)
+        lines = [
+            (label,                              CYAN),
+            (f"Hold steady...  {pct}%",          GREEN),
+            ("Keep finger on START point.",      WHITE),
+        ]
+        bar_progress = st.position_progress
+        bar_color    = GREEN
+
+    elif st.state == TS.TRACING:
+        rem   = st.time_remaining
+        t_col = RED if rem < 2 else YELLOW if rem < 4 else GREEN
+        lines = [
+            (f"  RECORDING  {label}",            RED),
+            (f"{st.point_count} points  |  {rem:.1f} s left", t_col),
+            ("Reach END point, or close fist.",  WHITE),
+        ]
+        bar_progress = 1.0 - st.draw_progress   # remaining fraction
+        bar_color    = t_col
+
+    elif st.state == TS.COMPLETED:
+        lines = [
+            (label,                              CYAN),
+            ("Analysing trace...",               YELLOW),
+        ]
+        bar_progress = None
+        bar_color    = None
+
+    else:
+        return   # VERIFIED / FAILED handled by the liveness state block
+
+    if not lines:
+        return
+
+    has_bar  = bar_progress is not None
+    panel_h  = len(lines) * LINE_H + 2 * PAD_Y + (8 if has_bar else 0)
+
+    # ── Semi-transparent dark background ─────────────────────────────
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (PX, PY), (PX + PW, PY + panel_h), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
+
+    # Coloured left accent bar.
+    accent = GREEN if st.state in (TS.POSITIONING, TS.IDLE) else \
+             RED   if st.state == TS.TRACING               else CYAN
+    cv2.rectangle(frame, (PX, PY), (PX + 3, PY + panel_h), accent, -1)
+
+    # Thin border.
+    cv2.rectangle(frame, (PX, PY), (PX + PW, PY + panel_h), (80, 80, 80), 1)
+
+    # ── Text lines ────────────────────────────────────────────────────
+    # Blinking red dot for TRACING state.
+    show_blink_dot = (st.state == TS.TRACING and int(time.time() * 2) % 2 == 0)
+
+    for i, (text, color) in enumerate(lines):
+        ty = PY + PAD_Y + (i + 1) * LINE_H - 5
+        if i == 0 and show_blink_dot:
+            # Draw blinking record indicator on line 0.
+            cv2.circle(frame, (PX + PAD_X + 5, ty - 7), 5, RED, -1)
+        tx = PX + PAD_X + (16 if (i == 0 and show_blink_dot) else 0)
+        cv2.putText(frame, text, (tx, ty), FONT, 0.48, color, 1, cv2.LINE_AA)
+
+    # ── Inline progress bar ───────────────────────────────────────────
+    if has_bar:
+        bx1 = PX + PAD_X
+        bx2 = PX + PW - PAD_X
+        by  = PY + panel_h - PAD_Y
+        filled = int((bx2 - bx1) * max(0.0, min(1.0, bar_progress)))
+        cv2.rectangle(frame, (bx1, by - 4), (bx2, by), (50, 50, 50), -1)
+        if filled > 0:
+            cv2.rectangle(frame, (bx1, by - 4), (bx1 + filled, by), bar_color, -1)
+
+
+def _draw_traced_path(frame, traced, w: int, h: int) -> None:
+    """Draw the user's recorded trace as a colour-shifting polyline.
+
+    Colour transitions cyan → magenta along the path so direction is
+    immediately visible.  The current fingertip position is marked with a
+    bright white dot.
+    """
+    if len(traced) < 2:
+        return
+    pts = [(int(x * w), int(y * h)) for x, y in traced]
+    total = len(pts)
+    for i in range(1, total):
+        t = i / total
+        r = int(200 * t)
+        g = int(220 * (1 - t))
+        b = 255
+        cv2.line(frame, pts[i - 1], pts[i], (b, g, r), 3, lineType=cv2.LINE_AA)
+    # Live fingertip dot
+    cv2.circle(frame, pts[-1], 8, WHITE, -1)
+    cv2.circle(frame, pts[-1], 8, CYAN,  2)
+
+
 def draw_liveness_hud(frame, gm: GameManager, hands):
     lv = gm.liveness
     h, w = frame.shape[:2]
@@ -353,6 +689,15 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
     if lv.is_drawing_cmd and ls == LivenessState.ACTIVE:
         _draw_air_canvas(frame, lv.drawing_path, w, h)
 
+    # Shape tracing canvas (template guide + live trace, always behind text).
+    if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+        st = lv.shape_tracer
+        _draw_shape_template(frame, st.template, w, h,
+                             tracer_state=st.state,
+                             position_progress=st.position_progress)
+        if st.state in (TracerState.TRACING, TracerState.VERIFIED, TracerState.FAILED):
+            _draw_traced_path(frame, st.traced_path, w, h)
+
     # -- Verification score bar (top) -------------------------------------
     _draw_verification_bar(frame, lv.verification_pct, y=10)
 
@@ -361,8 +706,22 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
     put_text_with_bg(frame, f"Score: {lv.score}", (20, 85), font_scale=0.7, color=GREEN, thickness=2)
 
     # Countdown ring
-    if ls not in (LivenessState.VERIFIED_100,):
-        draw_countdown_ring(frame, lv.time_remaining, lv._effective_time_limit, w - 90, 90, radius=55)
+    # For shape-trace: hide the liveness ring during pre-trace states (no timer
+    # running yet); show the tracer's own draw timer only during TRACING.
+    _hide_ring = False
+    if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+        _st = lv.shape_tracer
+        if _st.state in (TracerState.INSTRUCTING, TracerState.IDLE,
+                         TracerState.POSITIONING):
+            _hide_ring = True
+        elif _st.state == TracerState.TRACING:
+            from shape_tracer import DEFAULT_DRAW_TIME as _DDT
+            draw_countdown_ring(frame, _st.time_remaining, _DDT,
+                                w - 90, 90, radius=55)
+            _hide_ring = True
+    if not _hide_ring and ls not in (LivenessState.VERIFIED_100,):
+        draw_countdown_ring(frame, lv.time_remaining, lv._effective_time_limit,
+                            w - 90, 90, radius=55)
 
     spoof = lv.spoof_result
 
@@ -377,22 +736,46 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
     if ls == LivenessState.SUCCESS:
         if lv.is_drawing_cmd:
             _draw_air_canvas(frame, lv.drawing_path, w, h)
-        put_text_centered(frame, "VERIFIED!", h // 2 - 20, font_scale=1.4, color=GREEN, thickness=3)
+        put_text_centered(frame, "VERIFIED!", h // 2 - 20,
+                          font_scale=1.4, color=GREEN, thickness=3)
+        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+            pct     = lv.shape_tracer.similarity_pct
+            s_color = GREEN if pct >= 70 else YELLOW if pct >= 40 else RED
+            # Result detail → top-left, not centre.
+            put_text_with_bg(frame,
+                             f"Similarity: {pct:.0f}%  DTW: {lv.shape_tracer.dtw_cost:.3f}",
+                             (12, 108), font_scale=0.55, color=s_color)
     elif ls == LivenessState.FAILED:
-        put_text_centered(frame, "FAILED!", h // 2 - 20, font_scale=1.4, color=RED, thickness=3)
-        put_text_centered(frame, "Next challenge incoming...", h // 2 + 30, font_scale=0.7, color=YELLOW)
+        put_text_centered(frame, "FAILED!", h // 2 - 20,
+                          font_scale=1.4, color=RED, thickness=3)
+        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+            pct = lv.shape_tracer.similarity_pct
+            put_text_with_bg(frame,
+                             f"Similarity: {pct:.0f}%  (need DTW <= 0.25)",
+                             (12, 108), font_scale=0.55, color=YELLOW)
+            put_text_with_bg(frame, "Next challenge incoming...",
+                             (12, 132), font_scale=0.52, color=YELLOW)
+        else:
+            put_text_centered(frame, "Next challenge incoming...",
+                              h // 2 + 55, font_scale=0.7, color=YELLOW)
     else:
         cmd_color = ORANGE if ls == LivenessState.DEBOUNCE else CYAN
-        put_text_centered(frame, lv.command_label, h // 2 - 30, font_scale=1.0, color=cmd_color, thickness=2)
+        # Shape-trace: suppress the centre command label (panel handles it).
+        if not lv.is_shape_trace_cmd:
+            put_text_centered(frame, lv.command_label, h // 2 - 30,
+                              font_scale=1.0, color=cmd_color, thickness=2)
         if ls == LivenessState.DEBOUNCE:
-            draw_progress_bar(frame, lv.debounce_progress, y=h // 2 + 10, color_full=GREEN, color_fill=ORANGE)
-            put_text_centered(frame, "Confirming...", h // 2 + 50, font_scale=0.7, color=ORANGE)
+            draw_progress_bar(frame, lv.debounce_progress,
+                              y=h // 2 + 10, color_full=GREEN, color_fill=ORANGE)
+            put_text_centered(frame, "Confirming...", h // 2 + 50,
+                              font_scale=0.7, color=ORANGE)
 
         # Wave progress counter.
         if lv.is_wave_cmd:
             rev = lv.wave_reversals
             rev_color = GREEN if rev >= 2 else YELLOW if rev >= 1 else WHITE
-            put_text_with_bg(frame, f"Waves: {rev}/2", (20, h - 125), font_scale=0.65, color=rev_color)
+            put_text_with_bg(frame, f"Waves: {rev}/2", (20, h - 125),
+                             font_scale=0.65, color=rev_color)
 
         # Finger touch hold counter + progress bar.
         if lv.is_touch_cmd:
@@ -406,8 +789,15 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
         # Drawing hint.
         if lv.is_drawing_cmd:
             pts = lv.drawing_point_count
-            hint = f"Drawing... ({pts} pts) - close fist to finish" if pts > 0 else "Extend index finger and draw"
-            put_text_with_bg(frame, hint, (20, h - 125), font_scale=0.55, color=MAGENTA)
+            hint = (f"Drawing... ({pts} pts) - close fist to finish"
+                    if pts > 0 else "Extend index finger and draw")
+            put_text_with_bg(frame, hint, (20, h - 125),
+                             font_scale=0.55, color=MAGENTA)
+
+        # Shape tracing: ALL text goes to the top-left panel — centre stays clear.
+        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+            _draw_shape_info_panel(frame, lv.shape_tracer, lv.shape_trace_label,
+                                   w, h)
 
     status_color = GREEN if ls == LivenessState.SUCCESS else RED if ls == LivenessState.FAILED else YELLOW
     put_text_with_bg(frame, lv.status_label, (20, h - 90), font_scale=0.7, color=status_color)
@@ -600,8 +990,191 @@ def draw_touch_test_hud(frame, gm: GameManager, hands):
                      font_scale=0.6, color=YELLOW)
 
 
+def draw_shape_eval_hud(frame, gm: GameManager, hands):
+    """Visual Debugger HUD for the Shape Tracing Evaluation mode.
+
+    Layout
+    ------
+    Top bar     : eval mode badge + session stats (attempts, FAR, FRR)
+    Centre      : GREEN target shape + RED user/simulated path + state text
+    Bottom-left : latest attempt metrics (DTW, similarity, drift, time)
+    Bottom-right: running averages
+    Key hints   : E = cycle eval mode, R = restart round
+    """
+    ev = gm.shape_eval
+    h, w = frame.shape[:2]
+    stats = ev.evaluator.stats
+
+    # ── Mode colour ───────────────────────────────────────────────────
+    MODE_COLORS = {
+        EvalMode.HUMAN_TEST:    GREEN,
+        EvalMode.STATIC_ATTACK: ORANGE,
+        EvalMode.RANDOM_ATTACK: RED,
+    }
+    mode_col = MODE_COLORS.get(ev.eval_mode, WHITE)
+
+    # ── Visual Debugger: draw guide shapes ────────────────────────────
+    # GREEN  = target shape template (what the user should trace)
+    # RED    = user's real-time path or simulated attack path
+
+    tpl = ev.debug_template_path
+    usr = ev.debug_user_path
+
+    # Draw template in GREEN with ghost trace + directional arrows
+    _eval_tpl = ev.current_template
+    _eval_ts  = ev.human_tracer_state  # None in attack modes
+    if _eval_tpl is not None and len(tpl) >= 2:
+        # Ghost trace during INSTRUCTING / IDLE.
+        if _eval_ts in (None,) or True:   # always show ghost in eval mode
+            from shape_tracer import TracerState as _ETS
+            if _eval_ts in (_ETS.INSTRUCTING, _ETS.IDLE, None):
+                _draw_ghost_trace(frame, list(_eval_tpl.waypoints), w, h)
+
+        # Green semi-transparent overlay.
+        pts = [(int(x * w), int(y * h)) for x, y in tpl]
+        overlay = frame.copy()
+        for i in range(1, len(pts)):
+            cv2.line(overlay, pts[i-1], pts[i], (0, 200, 80), 3, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+        for i in range(1, len(pts)):
+            cv2.line(frame, pts[i-1], pts[i], (0, 220, 100), 2, cv2.LINE_AA)
+
+        # Directional arrows in dark green.
+        _draw_direction_arrows(frame, pts, (0, 160, 60))
+
+        # START marker using template's explicit start_point.
+        _sx = int(_eval_tpl.start_point[0] * w)
+        _sy = int(_eval_tpl.start_point[1] * h)
+        cv2.circle(frame, (_sx, _sy), 10, (0, 255, 200), -1)
+        cv2.putText(frame, "START", (_sx + 12, _sy + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 200), 1, cv2.LINE_AA)
+        # END marker (only when start != end).
+        _ex = int(_eval_tpl.end_point[0] * w)
+        _ey = int(_eval_tpl.end_point[1] * h)
+        if (_ex, _ey) != (_sx, _sy):
+            cv2.circle(frame, (_ex, _ey), 10, ORANGE, -1)
+            cv2.putText(frame, "END", (_ex + 12, _ey + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, ORANGE, 1, cv2.LINE_AA)
+
+    # Draw user / attack path in RED
+    if len(usr) >= 2:
+        pts_u = [(int(x * w), int(y * h)) for x, y in usr]
+        for i in range(1, len(pts_u)):
+            t = i / len(pts_u)
+            # Gradient: red at start, orange-red at end
+            cv2.line(frame, pts_u[i-1], pts_u[i],
+                     (40, int(80*t), 220), 3, cv2.LINE_AA)
+        cv2.circle(frame, pts_u[-1], 7, (0, 60, 255), -1)
+        cv2.circle(frame, pts_u[-1], 7, WHITE, 1)
+
+    # ── Top bar: eval mode badge + session stats ──────────────────────
+    bar_h = 44
+    cv2.rectangle(frame, (0, 0), (w, bar_h), DARK_BG, -1)
+
+    # Mode badge
+    badge_label = f" {ev.eval_mode.label} "
+    cv2.rectangle(frame, (8, 5), (8 + len(badge_label)*10, 38), mode_col, -1)
+    cv2.putText(frame, badge_label, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
+
+    # Stats: Attempts | Humans | Attacks | FAR | FRR
+    stat_txt = (f"Att:{stats['total']}  "
+                f"H:{stats['human_total']}  "
+                f"Atk:{stats['attack_total']}  |  "
+                f"FAR:{stats['far']*100:.0f}%  "
+                f"FRR:{stats['frr']*100:.0f}%")
+    put_text_with_bg(frame, stat_txt, (220, 30), font_scale=0.55, color=WHITE)
+
+    # Shape label + state
+    put_text_centered(frame, f"Shape: {ev.shape_label}",
+                      h // 2 - 55, font_scale=0.8, color=CYAN, thickness=2)
+
+    # ── Centre state / instruction ────────────────────────────────────
+    state_label = ev.state_label
+    if ev.eval_state == _EvalState.RESULT and ev.latest_log:
+        res_col = GREEN if ev.latest_log.result == "VERIFIED" else RED
+        put_text_centered(frame, ev.latest_log.result,
+                          h // 2 - 20, font_scale=1.3, color=res_col, thickness=3)
+        sim_col = GREEN if ev.result_similarity >= 70 else YELLOW if ev.result_similarity >= 40 else RED
+        put_text_centered(frame,
+                          f"Similarity: {ev.result_similarity:.1f}%  "
+                          f"DTW: {ev.result_dtw_cost:.3f}",
+                          h // 2 + 20, font_scale=0.72, color=sim_col)
+        put_text_centered(frame,
+                          f"Drift: {ev.result_drift:.3f}  "
+                          f"Time: {ev.result_time:.1f}s  "
+                          f"Points: {ev.latest_log.point_count}",
+                          h // 2 + 48, font_scale=0.6, color=WHITE)
+        put_text_centered(frame, "Next round starting...",
+                          h // 2 + 78, font_scale=0.55, color=YELLOW)
+
+    elif ev.eval_mode == EvalMode.HUMAN_TEST:
+        ts = ev.human_tracer_state
+        if ts is not None:
+            from shape_tracer import TracerState as TS
+            if ts == TS.INSTRUCTING:
+                rem = ev._tracer.instruct_remaining if ev._tracer else 0.0
+                put_text_centered(frame,
+                                  f"Read instructions...  {rem:.1f}s",
+                                  h // 2 - 20, font_scale=0.65, color=YELLOW)
+            elif ts == TS.IDLE:
+                put_text_centered(frame, "Move index finger to the START point",
+                                  h // 2 - 20, font_scale=0.65, color=YELLOW)
+            elif ts == TS.POSITIONING:
+                pct = int(ev.human_position_progress * 100)
+                put_text_centered(frame, f"Hold at START...  {pct}%",
+                                  h // 2 - 20, font_scale=0.65, color=GREEN)
+            elif ts == TS.TRACING:
+                t_rem = ev.human_time_remaining
+                t_col = RED if t_rem < 2 else YELLOW if t_rem < 4 else WHITE
+                put_text_centered(frame,
+                                  f"Tracing  {ev.human_point_count} pts  |  {t_rem:.1f}s left",
+                                  h // 2 - 20, font_scale=0.7, color=t_col, thickness=2)
+                put_text_centered(frame, "Reach END point or close fist",
+                                  h // 2 + 12, font_scale=0.58, color=ORANGE)
+            elif ts == TS.COMPLETED:
+                put_text_centered(frame, "Computing DTW...",
+                                  h // 2 - 20, font_scale=0.8, color=CYAN)
+    else:
+        # Attack mode: show animation progress
+        pct = int(ev.attack_animation_progress * 100)
+        put_text_centered(frame, f"Simulating attack...  {pct}%",
+                          h // 2 - 20, font_scale=0.75, color=mode_col, thickness=2)
+        draw_progress_bar(frame, ev.attack_animation_progress,
+                          y=h // 2 + 5, color_full=mode_col, color_fill=mode_col)
+
+    # ── Legend (bottom-left) ─────────────────────────────────────────
+    cv2.rectangle(frame, (0, h - 62), (w, h), DARK_BG, -1)
+
+    # Colour legend
+    cv2.line(frame, (10, h-46), (35, h-46), (0, 220, 100), 3)
+    cv2.putText(frame, "Target shape", (40, h-40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 220, 100), 1, cv2.LINE_AA)
+    cv2.line(frame, (10, h-26), (35, h-26), (0, 60, 255), 3)
+    cv2.putText(frame, "User / Attack path", (40, h-20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 60, 255), 1, cv2.LINE_AA)
+
+    # Running averages (right side)
+    if stats["human_total"] > 0:
+        avg_txt = (f"Avg Sim: {stats['avg_similarity']:.1f}%  "
+                   f"Avg DTW: {stats['avg_dtw_cost']:.3f}  "
+                   f"Avg Time: {stats['avg_time']:.1f}s")
+        put_text_with_bg(frame, avg_txt, (w // 2 + 20, h - 40),
+                         font_scale=0.48, color=CYAN)
+
+    # Key hints
+    put_text_with_bg(frame, "E=cycle mode  R=restart",
+                     (w - 230, h - 20), font_scale=0.48, color=YELLOW)
+
+    # Log file path tip (top-right, small)
+    log_info = f"Log: {stats.get('log_path', 'eval_logs/attempts.csv')}"
+    put_text_with_bg(frame, log_info, (w - 420, bar_h + 12),
+                     font_scale=0.38, color=WHITE, bg=(20, 20, 20))
+
+
 _HUD_DRAWERS = [draw_normal_hud, draw_math_hud, draw_simon_hud,
-                draw_liveness_hud, draw_sequential_hud, draw_touch_test_hud]
+                draw_liveness_hud, draw_sequential_hud, draw_touch_test_hud,
+                draw_shape_eval_hud]
 
 
 # ── Main loop ───────────────────────────────────────────────────────
@@ -673,6 +1246,9 @@ def run():
             elif key == ord("r"):
                 gm.restart()
                 print(f"{gm.mode_name} restarted!")
+            elif key == ord("e") and gm.current_mode == 6:
+                gm.shape_eval.cycle_mode()
+                print(f"Eval mode: {gm.shape_eval.eval_mode.label}")
 
     cap.release()
     cv2.destroyAllWindows()

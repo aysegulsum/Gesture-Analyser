@@ -275,10 +275,11 @@ class LivenessChallenge:
         if ct == CmdType.FINGER_TOUCH:
             return self.time_limit + 1.0
         if ct == CmdType.SHAPE_TRACE:
-            # The ShapeTracerSession owns the 8 s draw window internally;
-            # give the liveness wrapper a wide safety-net so its timeout
-            # never fires before the tracer's own limit does.
-            return self.time_limit + DEFAULT_DRAW_TIME + 3.0
+            # With the Point-to-Point Trigger the user spends an unknown
+            # amount of time in IDLE / POSITIONING before TRACING begins.
+            # Give the liveness wrapper a very wide safety-net (2 min) so
+            # it never fires before the tracer's own TRACING timer runs out.
+            return self.time_limit + DEFAULT_DRAW_TIME + 120.0
         return self.time_limit
 
     @property

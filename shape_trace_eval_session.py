@@ -28,6 +28,7 @@ from shape_tracer import (
     generate_random_shape, ShapeTemplate,
     _resample, _centroid_normalise, dtw_normalised_cost,
     DEFAULT_DRAW_TIME, DEFAULT_DTW_THRESH, DEFAULT_RESAMPLE_N,
+    DEFAULT_POS_HOLD,
 )
 from tracing_evaluator import (
     TracingEvaluator, AttemptLog,
@@ -297,6 +298,13 @@ class ShapeTraceEvalSession:
     def human_time_remaining(self) -> float:
         if self._tracer and self.eval_mode == EvalMode.HUMAN_TEST:
             return self._tracer.time_remaining
+        return 0.0
+
+    @property
+    def human_position_progress(self) -> float:
+        """0.0-1.0 POSITIONING countdown progress for HUMAN_TEST mode."""
+        if self._tracer and self.eval_mode == EvalMode.HUMAN_TEST:
+            return self._tracer.position_progress
         return 0.0
 
     @property

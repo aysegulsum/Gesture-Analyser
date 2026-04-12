@@ -8,22 +8,30 @@ Architecture
 ------------
 
               ┌────────────┐
-   start      │            │  show shape guide on screen;
-  ───────────►│  WAITING   │  await index finger at sufficient depth
+   start      │            │  shape guide shown on screen;
+  ───────────►│    IDLE    │  waiting for finger to approach Start Point
               │            │
               └─────┬──────┘
-                    │ index finger extended (depth gate passed)
+                    │ finger enters Start Point radius
+                    ▼
+              ┌────────────┐
+              │            │  hold position for 500 ms;
+              │POSITIONING │  arc-fill shows countdown progress;
+              │            │  if finger leaves → back to IDLE
+              └─────┬──────┘
+                    │ 500 ms hold complete → timer STARTS
                     ▼
               ┌────────────┐
               │            │  record Index Tip (ID 8) path each frame;
-              │  DRAWING   │  overlay trace on screen;
+              │  TRACING   │  overlay trace on screen; timer counting down;
               │            │  liveness gate: hand_scale > min_hand_scale
               └──┬──────┬──┘
-     fist / done │      │ time expired
+  finger at END  │      │ time expired  (or hand lost)
+  (start_armed)  │      │
                  ▼      ▼
               ┌────────────┐
               │            │  single-frame DTW computation:
-              │ VERIFYING  │    1. resample both paths to N points
+              │ COMPLETED  │    1. resample both paths to N points
               │            │    2. centroid-normalise (translation + scale invariant)
               └──┬──────┬──┘    3. DTW cost matrix (numpy distance mat + Python DP)
       cost ≤ th  │      │  cost > th / too few points
@@ -38,6 +46,19 @@ Shape templates (normalised screen coords, [0, 1]²)
   SQUARE   -- 5-waypoint closed rectangle
   TRIANGLE -- 4-waypoint closed triangle
   S_CURVE  -- 18 control points (two opposing quarter-circle arcs)
+
+Point-to-Point Trigger
+-----------------------
+  Each ShapeTemplate carries explicit start_point and end_point.
+  • Recording (TRACING state) does NOT begin until the user holds their
+    index fingertip within START_RADIUS (0.06) of start_point for
+    position_hold_time seconds (default 0.50 s).
+  • The countdown timer starts only after the TRACING state begins.
+  • For closed shapes (start == end) a _start_armed flag is used:
+    it becomes True once the finger moves away from start_point, so the
+    end trigger cannot fire immediately on entry.
+  • Recording ends when the fingertip is within END_RADIUS of end_point
+    AND _start_armed is True, or when the time limit expires.
 
 Verification algorithm (DTW)
 -----------------------------
@@ -82,10 +103,25 @@ class ShapeTemplate:
     Waypoints represent the expected tracing direction (clockwise for
     closed shapes, top-to-bottom for open curves).  They are drawn as a
     semi-transparent guide on the video frame.
+
+    Parameters
+    ----------
+    start_point : (x, y)
+        Normalised coordinate where the user must hold their finger to
+        begin recording.  Highlighted with a pulsing cyan ring in IDLE state.
+    end_point : (x, y)
+        Normalised coordinate that, when reached, automatically ends the
+        trace and triggers verification.
+    min_trace_points : int
+        Minimum number of recorded points required for a valid attempt.
+        Attempts with fewer points always result in FAILED.
     """
-    shape_type: ShapeType
-    label:      str
-    waypoints:  tuple[tuple[float, float], ...]
+    shape_type:       ShapeType
+    label:            str
+    waypoints:        tuple[tuple[float, float], ...]
+    start_point:      tuple[float, float]
+    end_point:        tuple[float, float]
+    min_trace_points: int = 25
 
 
 # ── Template builders ────────────────────────────────────────────────
@@ -98,26 +134,33 @@ def _circle_template(cx: float = 0.50, cy: float = 0.50,
          round(cy + r * math.sin(2 * math.pi * i / n), 6))
         for i in range(n + 1)   # +1 closes the loop back to start
     )
-    return ShapeTemplate(ShapeType.CIRCLE, "CIRCLE", pts)
+    start = (round(cx + r, 6), round(cy, 6))   # 3-o'clock = (0.68, 0.50)
+    return ShapeTemplate(
+        ShapeType.CIRCLE, "CIRCLE", pts,
+        start_point=start, end_point=start, min_trace_points=40,
+    )
 
 
 def _square_template(l: float = 0.32, t: float = 0.30,
                      r: float = 0.68, b: float = 0.70) -> ShapeTemplate:
     """Closed rectangle traced clockwise from the top-left corner."""
-    return ShapeTemplate(ShapeType.SQUARE, "SQUARE", (
-        (l, t), (r, t), (r, b), (l, b), (l, t),
-    ))
+    start = (l, t)
+    return ShapeTemplate(
+        ShapeType.SQUARE, "SQUARE",
+        ((l, t), (r, t), (r, b), (l, b), (l, t)),
+        start_point=start, end_point=start, min_trace_points=30,
+    )
 
 
 def _triangle_template(cx: float = 0.50, ty: float = 0.25,
                         by: float = 0.72, hw: float = 0.22) -> ShapeTemplate:
     """Isosceles triangle: top → bottom-right → bottom-left → top."""
-    return ShapeTemplate(ShapeType.TRIANGLE, "TRIANGLE", (
-        (cx,       ty),
-        (cx + hw,  by),
-        (cx - hw,  by),
-        (cx,       ty),
-    ))
+    start = (cx, ty)
+    return ShapeTemplate(
+        ShapeType.TRIANGLE, "TRIANGLE",
+        ((cx, ty), (cx + hw, by), (cx - hw, by), (cx, ty)),
+        start_point=start, end_point=start, min_trace_points=25,
+    )
 
 
 def _s_curve_template() -> ShapeTemplate:
@@ -133,7 +176,13 @@ def _s_curve_template() -> ShapeTemplate:
         a = math.pi * 2 + (math.pi / 2) * (i / 8)  # 2π → 5π/2
         pts.append((round(0.38 + 0.14 * math.cos(a), 6),
                     round(0.625 + 0.125 * math.sin(a), 6)))
-    return ShapeTemplate(ShapeType.S_CURVE, "S-CURVE", tuple(pts))
+
+    start_pt = pts[0]   # (0.48, 0.375)  top of upper arc
+    end_pt   = pts[-1]  # (0.38, 0.75)   bottom of lower arc
+    return ShapeTemplate(
+        ShapeType.S_CURVE, "S-CURVE", tuple(pts),
+        start_point=start_pt, end_point=end_pt, min_trace_points=15,
+    )
 
 
 _TEMPLATES: list[ShapeTemplate] = [
@@ -245,21 +294,41 @@ def dtw_normalised_cost(
     return float(dtw[n, m]) / max(n, m)
 
 
+# ── Proximity helper ─────────────────────────────────────────────────
+
+# Radius (in normalised [0,1] screen coords) for start/end trigger zones.
+START_RADIUS = 0.06
+END_RADIUS   = 0.07
+# When finger is farther than this from start_point, _start_armed becomes True.
+ARM_RADIUS   = 0.10
+
+
+def _finger_near_point(fx: float, fy: float,
+                       px: float, py: float,
+                       radius: float = START_RADIUS) -> bool:
+    """Return True if (fx, fy) is within *radius* of (px, py)."""
+    return math.sqrt((fx - px) ** 2 + (fy - py) ** 2) <= radius
+
+
 # ── Tracer state machine ─────────────────────────────────────────────
 
 class TracerState(Enum):
-    WAITING   = auto()  # shape displayed; waiting for index finger at depth
-    DRAWING   = auto()  # recording Index Tip path in real time
-    VERIFYING = auto()  # single-frame DTW computation
-    VERIFIED  = auto()  # DTW cost ≤ threshold → accepted
-    FAILED    = auto()  # timed out or DTW cost too high
+    INSTRUCTING = auto()  # brief instruction overlay before showing shape
+    IDLE        = auto()  # shape displayed; waiting for finger at Start Point
+    POSITIONING = auto()  # finger on Start Point; 500ms countdown
+    TRACING     = auto()  # recording; timer running
+    COMPLETED   = auto()  # single-frame DTW computation (instant transition)
+    VERIFIED    = auto()  # DTW cost ≤ threshold → accepted
+    FAILED      = auto()  # timed out or DTW cost too high / too few points
 
 
 # Defaults used by ShapeTracerSession and by liveness_session integration
-DEFAULT_DRAW_TIME    = 8.0   # seconds per trace attempt
+DEFAULT_DRAW_TIME    = 10.0  # seconds per trace attempt (timer starts at TRACING)
 DEFAULT_DTW_THRESH   = 0.25  # normalised per-point DTW cost threshold
 DEFAULT_RESAMPLE_N   = 50    # number of points for DTW comparison
 DEFAULT_MIN_HS       = 0.10  # minimum hand_scale for depth liveness gate
+DEFAULT_POS_HOLD     = 0.50  # seconds to hold at start point before TRACING
+DEFAULT_INSTRUCT_TIME = 3.0  # seconds to show instruction overlay
 
 
 @dataclass
@@ -269,17 +338,18 @@ class ShapeTracerSession:
     Parameters
     ----------
     time_limit : float
-        Seconds the user has to complete a single tracing attempt.
+        Seconds the user has to trace once the TRACING state begins.
+        Does NOT count IDLE / POSITIONING time.
     min_hand_scale : float
         Minimum wrist-to-MiddleMCP distance (hand_scale) that counts as
-        'hand in frame'.  Acts as a depth-based liveness gate: a printed
-        photo of a hand will typically score below this threshold.
+        'hand in frame'.  Acts as a depth-based liveness gate.
     dtw_threshold : float
         Maximum normalised per-point DTW cost accepted as a valid trace.
-        Lower = stricter.  Default 0.25 corresponds to ~25% of the shape
-        radius average error.
     resample_n : int
         Number of resampled points used in the DTW comparison.
+    position_hold_time : float
+        Seconds the index finger must stay inside START_RADIUS before
+        TRACING begins.
     pause_after_result : float
         Seconds to hold VERIFIED / FAILED before the session may be reset.
     """
@@ -288,23 +358,30 @@ class ShapeTracerSession:
     min_hand_scale:     float = DEFAULT_MIN_HS
     dtw_threshold:      float = DEFAULT_DTW_THRESH
     resample_n:         int   = DEFAULT_RESAMPLE_N
+    position_hold_time: float = DEFAULT_POS_HOLD
+    instruction_duration: float = DEFAULT_INSTRUCT_TIME
     pause_after_result: float = 2.0
 
     # -- observable (read by HUD) -----------------------------------------
-    state:      TracerState = field(init=False, default=TracerState.WAITING)
+    state:      TracerState = field(init=False, default=TracerState.INSTRUCTING)
     template:   ShapeTemplate = field(init=False)
     similarity: float = field(init=False, default=0.0)   # 0 … 1
     dtw_cost:   float = field(init=False, default=0.0)
 
     # -- internal ---------------------------------------------------------
-    _traced:         list[tuple[float, float]] = field(init=False, default_factory=list)
-    _raw_buf:        list[tuple[float, float]] = field(init=False, default_factory=list)
-    _draw_start:     Optional[float] = field(init=False, default=None)
-    _result_at:      Optional[float] = field(init=False, default=None)
-    _was_index_open: bool = field(init=False, default=False)
+    _traced:          list[tuple[float, float]] = field(init=False, default_factory=list)
+    _raw_buf:         list[tuple[float, float]] = field(init=False, default_factory=list)
+    _draw_start:      Optional[float] = field(init=False, default=None)   # set on TRACING entry
+    _position_start:  Optional[float] = field(init=False, default=None)   # set on POSITIONING entry
+    _instruct_start:  Optional[float] = field(init=False, default=None)   # set on INSTRUCTING entry
+    _result_at:       Optional[float] = field(init=False, default=None)
+    _was_index_open:  bool = field(init=False, default=False)
+    # True once finger moves far enough from start to enable end trigger
+    _start_armed:     bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
-        self.template = generate_random_shape()
+        self.template        = generate_random_shape()
+        self._instruct_start = time.time()
 
     # -- Point recording (3-point moving-average smoothing) ---------------
 
@@ -328,7 +405,7 @@ class ShapeTracerSession:
     def _run_verification(self) -> None:
         """Compute DTW similarity and transition to VERIFIED or FAILED."""
         now = time.time()
-        if len(self._traced) < 10:
+        if len(self._traced) < self.template.min_trace_points:
             self.state      = TracerState.FAILED
             self._result_at = now
             return
@@ -340,7 +417,6 @@ class ShapeTracerSession:
 
         cost             = dtw_normalised_cost(t_norm, u_norm)
         self.dtw_cost    = cost
-        # Clamp: 1.0 at perfect match, 0.0 at cost == threshold, negative clamped to 0
         self.similarity  = max(0.0, min(1.0, 1.0 - cost / self.dtw_threshold))
         self.state       = TracerState.VERIFIED if cost <= self.dtw_threshold else TracerState.FAILED
         self._result_at  = now
@@ -355,8 +431,30 @@ class ShapeTracerSession:
         """
         now = time.time()
 
-        # VERIFYING runs for exactly one frame then transitions.
-        if self.state == TracerState.VERIFYING:
+        # ── INSTRUCTING ───────────────────────────────────────────────
+        # Show instructions for instruction_duration seconds, then go IDLE.
+        # If the user is already impatient and holds finger at start → skip.
+        if self.state == TracerState.INSTRUCTING:
+            elapsed = now - (self._instruct_start or now)
+            if elapsed >= self.instruction_duration:
+                self.state = TracerState.IDLE
+                return self.state
+            # Fast-forward: finger already positioned at start point.
+            if hands:
+                hand0 = hands[0]
+                lm0   = hand0.landmarks
+                if _hs(lm0) >= self.min_hand_scale:
+                    tip = lm0[_LM["INDEX_TIP"]]
+                    if (is_finger_open(lm0, hand0.handedness, Finger.INDEX) and
+                            _finger_near_point(tip.x, tip.y,
+                                               *self.template.start_point,
+                                               START_RADIUS)):
+                        self._position_start = now
+                        self.state = TracerState.POSITIONING
+            return self.state
+
+        # COMPLETED runs verification for exactly one frame then transitions.
+        if self.state == TracerState.COMPLETED:
             self._run_verification()
             return self.state
 
@@ -364,50 +462,81 @@ class ShapeTracerSession:
         if self.state in (TracerState.VERIFIED, TracerState.FAILED):
             return self.state
 
-        # No hand detected.
+        # No hand detected → drop back from POSITIONING/TRACING to IDLE.
         if not hands:
-            if self.state == TracerState.DRAWING:
-                if len(self._traced) >= 10:
-                    self.state = TracerState.VERIFYING   # verify what was drawn
-                else:
-                    self._reset_drawing()                # too short, discard
+            if self.state == TracerState.TRACING:
+                # Complete with whatever was recorded (could be short).
+                self.state = TracerState.COMPLETED
+            elif self.state == TracerState.POSITIONING:
+                self._position_start = None
+                self.state = TracerState.IDLE
             return self.state
 
         hand = hands[0]
         lm   = hand.landmarks
 
         # ── Depth liveness gate ───────────────────────────────────────
-        # hand_scale = Dist(Wrist, MiddleMCP).  A printed photo or a
-        # hand held very far from the camera produces a small value.
         if _hs(lm) < self.min_hand_scale:
             return self.state
 
         index_tip  = lm[_LM["INDEX_TIP"]]
         index_open = is_finger_open(lm, hand.handedness, Finger.INDEX)
+        fx, fy     = index_tip.x, index_tip.y
 
-        # ── WAITING ───────────────────────────────────────────────────
-        if self.state == TracerState.WAITING:
-            if index_open:
+        # ── IDLE ──────────────────────────────────────────────────────
+        if self.state == TracerState.IDLE:
+            if index_open and _finger_near_point(fx, fy,
+                                                 *self.template.start_point,
+                                                 START_RADIUS):
+                self._position_start = now
+                self.state = TracerState.POSITIONING
+
+        # ── POSITIONING ───────────────────────────────────────────────
+        elif self.state == TracerState.POSITIONING:
+            if not index_open or not _finger_near_point(fx, fy,
+                                                        *self.template.start_point,
+                                                        START_RADIUS):
+                # Finger left the start zone → back to IDLE.
+                self._position_start = None
+                self.state = TracerState.IDLE
+            elif now - self._position_start >= self.position_hold_time:
+                # Held long enough → start recording.
                 self._reset_drawing()
-                self._draw_start     = now
-                self._was_index_open = True
-                self.state           = TracerState.DRAWING
-                self._push_point(index_tip.x, index_tip.y)
+                self._draw_start = now
+                # Closed shapes: arm flag only after finger moves away.
+                sp = self.template.start_point
+                ep = self.template.end_point
+                self._start_armed = (sp != ep)   # True for open shapes
+                self.state = TracerState.TRACING
+                self._push_point(fx, fy)
 
-        # ── DRAWING ───────────────────────────────────────────────────
-        elif self.state == TracerState.DRAWING:
-            # Hard time-limit: verify whatever has been collected.
+        # ── TRACING ───────────────────────────────────────────────────
+        elif self.state == TracerState.TRACING:
+            # Hard time-limit.
             if now - self._draw_start >= self.time_limit:
-                self.state = TracerState.VERIFYING
+                self.state = TracerState.COMPLETED
                 return self.state
 
             if index_open:
-                self._push_point(index_tip.x, index_tip.y)
+                self._push_point(fx, fy)
                 self._was_index_open = True
+
+                # Arm trigger once finger moves away from the start point.
+                if not self._start_armed:
+                    if not _finger_near_point(fx, fy,
+                                              *self.template.start_point,
+                                              ARM_RADIUS):
+                        self._start_armed = True
+
+                # End trigger: finger at end_point AND armed.
+                if self._start_armed and _finger_near_point(fx, fy,
+                                                            *self.template.end_point,
+                                                            END_RADIUS):
+                    self.state = TracerState.COMPLETED
             else:
-                # Fist after a valid drawing stroke → end stroke, verify.
-                if self._was_index_open and len(self._traced) >= 10:
-                    self.state = TracerState.VERIFYING
+                # Fist after a valid stroke → trigger completion.
+                if self._was_index_open and len(self._traced) >= self.template.min_trace_points:
+                    self.state = TracerState.COMPLETED
 
         return self.state
 
@@ -432,20 +561,42 @@ class ShapeTracerSession:
 
     @property
     def time_remaining(self) -> float:
+        """Seconds remaining in the TRACING window (0 when not tracing)."""
         if self._draw_start is None:
             return self.time_limit
         return max(0.0, self.time_limit - (time.time() - self._draw_start))
 
     @property
     def draw_progress(self) -> float:
-        """0.0 → 1.0 fraction of the time window used (for the ring timer)."""
+        """0.0 → 1.0 fraction of the TRACING time window used."""
         if self._draw_start is None:
             return 0.0
         return min((time.time() - self._draw_start) / self.time_limit, 1.0)
 
     @property
+    def position_progress(self) -> float:
+        """0.0 → 1.0 arc-fill for the POSITIONING countdown."""
+        if self._position_start is None:
+            return 0.0
+        return min((time.time() - self._position_start) / self.position_hold_time, 1.0)
+
+    @property
+    def instruct_progress(self) -> float:
+        """0.0 → 1.0 fraction of the instruction overlay elapsed."""
+        if self._instruct_start is None:
+            return 1.0
+        return min((time.time() - self._instruct_start) / max(self.instruction_duration, 0.001), 1.0)
+
+    @property
+    def instruct_remaining(self) -> float:
+        """Seconds remaining in the instruction phase."""
+        if self._instruct_start is None:
+            return 0.0
+        return max(0.0, self.instruction_duration - (time.time() - self._instruct_start))
+
+    @property
     def similarity_pct(self) -> float:
-        """0 – 100 similarity percentage (only meaningful after VERIFYING)."""
+        """0 – 100 similarity percentage (only meaningful after COMPLETED)."""
         return self.similarity * 100.0
 
     @property
@@ -453,10 +604,13 @@ class ShapeTracerSession:
         return len(self._traced)
 
     def reset(self) -> None:
-        """Pick a new random shape and return to WAITING."""
-        self.state      = TracerState.WAITING
-        self.template   = generate_random_shape()
-        self.similarity = 0.0
-        self.dtw_cost   = 0.0
-        self._result_at = None
+        """Pick a new random shape and restart from the INSTRUCTING phase."""
+        self.template        = generate_random_shape()
+        self.state           = TracerState.INSTRUCTING
+        self.similarity      = 0.0
+        self.dtw_cost        = 0.0
+        self._instruct_start = time.time()
+        self._result_at      = None
+        self._position_start = None
+        self._start_armed    = False
         self._reset_drawing()

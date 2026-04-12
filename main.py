@@ -34,6 +34,8 @@ from liveness_session import LivenessChallenge, LivenessState, CmdType
 from shape_tracer import TracerState
 from sequential_session import SequentialSession, SeqState, StepResult
 from finger_touch_session import FingerTouchSession, TouchTestState
+from tracing_evaluator import TracingEvaluator
+from shape_trace_eval_session import ShapeTraceEvalSession, EvalMode, _EvalState
 
 
 # -- colour palette -------------------------------------------------------
@@ -46,7 +48,7 @@ MAGENTA = (200, 50, 255)
 ORANGE = (0, 160, 255)
 DARK_BG = (40, 40, 40)
 
-MODE_NAMES = ["Normal", "Math", "Simon", "Liveness", "Sequential", "Touch Test"]
+MODE_NAMES = ["Normal", "Math", "Simon", "Liveness", "Sequential", "Touch Test", "Shape Eval"]
 
 
 # ── GameManager ─────────────────────────────────────────────────────
@@ -85,6 +87,13 @@ class GameManager:
         self.touch_test = FingerTouchSession(
             verify_frames=10, pause_after_success=1.5,
         )
+        _evaluator = TracingEvaluator(log_dir="eval_logs")
+        self.shape_eval = ShapeTraceEvalSession(
+            evaluator=_evaluator,
+            eval_mode=EvalMode.HUMAN_TEST,
+            dtw_threshold=0.25,
+            auto_advance=True,
+        )
 
         self.hands_present = False
 
@@ -104,6 +113,8 @@ class GameManager:
             self.sequential.reset()
         elif self.current_mode == 5:
             self.touch_test.reset()
+        elif self.current_mode == 6:
+            self.shape_eval.reset()
 
     def restart(self):
         if self.current_mode == 0:
@@ -118,6 +129,8 @@ class GameManager:
             self.sequential.reset()
         elif self.current_mode == 5:
             self.touch_test.reset()
+        elif self.current_mode == 6:
+            self.shape_eval.reset()
 
     def update(self, hands: list[HandResult]):
         """Global hand-presence check, then delegate to active mode.
@@ -142,6 +155,8 @@ class GameManager:
             self.sequential.update(hands)
         elif self.current_mode == 5:
             self.touch_test.update(hands)
+        elif self.current_mode == 6:
+            self.shape_eval.update(hands)
 
 
 # ── Drawing utilities ───────────────────────────────────────────────
@@ -685,8 +700,160 @@ def draw_touch_test_hud(frame, gm: GameManager, hands):
                      font_scale=0.6, color=YELLOW)
 
 
+def draw_shape_eval_hud(frame, gm: GameManager, hands):
+    """Visual Debugger HUD for the Shape Tracing Evaluation mode.
+
+    Layout
+    ------
+    Top bar     : eval mode badge + session stats (attempts, FAR, FRR)
+    Centre      : GREEN target shape + RED user/simulated path + state text
+    Bottom-left : latest attempt metrics (DTW, similarity, drift, time)
+    Bottom-right: running averages
+    Key hints   : E = cycle eval mode, R = restart round
+    """
+    ev = gm.shape_eval
+    h, w = frame.shape[:2]
+    stats = ev.evaluator.stats
+
+    # ── Mode colour ───────────────────────────────────────────────────
+    MODE_COLORS = {
+        EvalMode.HUMAN_TEST:    GREEN,
+        EvalMode.STATIC_ATTACK: ORANGE,
+        EvalMode.RANDOM_ATTACK: RED,
+    }
+    mode_col = MODE_COLORS.get(ev.eval_mode, WHITE)
+
+    # ── Visual Debugger: draw guide shapes ────────────────────────────
+    # GREEN  = target shape template (what the user should trace)
+    # RED    = user's real-time path or simulated attack path
+
+    tpl = ev.debug_template_path
+    usr = ev.debug_user_path
+
+    # Draw template in GREEN
+    if len(tpl) >= 2:
+        pts = [(int(x * w), int(y * h)) for x, y in tpl]
+        overlay = frame.copy()
+        for i in range(1, len(pts)):
+            cv2.line(overlay, pts[i-1], pts[i], (0, 200, 80), 3, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+        for i in range(1, len(pts)):
+            cv2.line(frame, pts[i-1], pts[i], (0, 220, 100), 2, cv2.LINE_AA)
+        # START marker
+        cv2.circle(frame, pts[0], 10, (0, 255, 200), -1)
+        cv2.putText(frame, "START", (pts[0][0]+12, pts[0][1]+5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 200), 1, cv2.LINE_AA)
+
+    # Draw user / attack path in RED
+    if len(usr) >= 2:
+        pts_u = [(int(x * w), int(y * h)) for x, y in usr]
+        for i in range(1, len(pts_u)):
+            t = i / len(pts_u)
+            # Gradient: red at start, orange-red at end
+            cv2.line(frame, pts_u[i-1], pts_u[i],
+                     (40, int(80*t), 220), 3, cv2.LINE_AA)
+        cv2.circle(frame, pts_u[-1], 7, (0, 60, 255), -1)
+        cv2.circle(frame, pts_u[-1], 7, WHITE, 1)
+
+    # ── Top bar: eval mode badge + session stats ──────────────────────
+    bar_h = 44
+    cv2.rectangle(frame, (0, 0), (w, bar_h), DARK_BG, -1)
+
+    # Mode badge
+    badge_label = f" {ev.eval_mode.label} "
+    cv2.rectangle(frame, (8, 5), (8 + len(badge_label)*10, 38), mode_col, -1)
+    cv2.putText(frame, badge_label, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
+
+    # Stats: Attempts | Humans | Attacks | FAR | FRR
+    stat_txt = (f"Att:{stats['total']}  "
+                f"H:{stats['human_total']}  "
+                f"Atk:{stats['attack_total']}  |  "
+                f"FAR:{stats['far']*100:.0f}%  "
+                f"FRR:{stats['frr']*100:.0f}%")
+    put_text_with_bg(frame, stat_txt, (220, 30), font_scale=0.55, color=WHITE)
+
+    # Shape label + state
+    put_text_centered(frame, f"Shape: {ev.shape_label}",
+                      h // 2 - 55, font_scale=0.8, color=CYAN, thickness=2)
+
+    # ── Centre state / instruction ────────────────────────────────────
+    state_label = ev.state_label
+    if ev.eval_state == _EvalState.RESULT and ev.latest_log:
+        res_col = GREEN if ev.latest_log.result == "VERIFIED" else RED
+        put_text_centered(frame, ev.latest_log.result,
+                          h // 2 - 20, font_scale=1.3, color=res_col, thickness=3)
+        sim_col = GREEN if ev.result_similarity >= 70 else YELLOW if ev.result_similarity >= 40 else RED
+        put_text_centered(frame,
+                          f"Similarity: {ev.result_similarity:.1f}%  "
+                          f"DTW: {ev.result_dtw_cost:.3f}",
+                          h // 2 + 20, font_scale=0.72, color=sim_col)
+        put_text_centered(frame,
+                          f"Drift: {ev.result_drift:.3f}  "
+                          f"Time: {ev.result_time:.1f}s  "
+                          f"Points: {ev.latest_log.point_count}",
+                          h // 2 + 48, font_scale=0.6, color=WHITE)
+        put_text_centered(frame, "Next round starting...",
+                          h // 2 + 78, font_scale=0.55, color=YELLOW)
+
+    elif ev.eval_mode == EvalMode.HUMAN_TEST:
+        ts = ev.human_tracer_state
+        if ts is not None:
+            from shape_tracer import TracerState as TS
+            if ts == TS.WAITING:
+                put_text_centered(frame, "Extend index finger over START to begin",
+                                  h // 2 - 20, font_scale=0.65, color=YELLOW)
+            elif ts == TS.DRAWING:
+                t_rem = ev.human_time_remaining
+                t_col = RED if t_rem < 2 else YELLOW if t_rem < 4 else WHITE
+                put_text_centered(frame,
+                                  f"Drawing  {ev.human_point_count} pts  |  {t_rem:.1f}s left",
+                                  h // 2 - 20, font_scale=0.7, color=t_col, thickness=2)
+                put_text_centered(frame, "Close fist to finish",
+                                  h // 2 + 12, font_scale=0.58, color=ORANGE)
+            elif ts == TS.VERIFYING:
+                put_text_centered(frame, "Computing DTW...",
+                                  h // 2 - 20, font_scale=0.8, color=CYAN)
+    else:
+        # Attack mode: show animation progress
+        pct = int(ev.attack_animation_progress * 100)
+        put_text_centered(frame, f"Simulating attack...  {pct}%",
+                          h // 2 - 20, font_scale=0.75, color=mode_col, thickness=2)
+        draw_progress_bar(frame, ev.attack_animation_progress,
+                          y=h // 2 + 5, color_full=mode_col, color_fill=mode_col)
+
+    # ── Legend (bottom-left) ─────────────────────────────────────────
+    cv2.rectangle(frame, (0, h - 62), (w, h), DARK_BG, -1)
+
+    # Colour legend
+    cv2.line(frame, (10, h-46), (35, h-46), (0, 220, 100), 3)
+    cv2.putText(frame, "Target shape", (40, h-40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 220, 100), 1, cv2.LINE_AA)
+    cv2.line(frame, (10, h-26), (35, h-26), (0, 60, 255), 3)
+    cv2.putText(frame, "User / Attack path", (40, h-20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 60, 255), 1, cv2.LINE_AA)
+
+    # Running averages (right side)
+    if stats["human_total"] > 0:
+        avg_txt = (f"Avg Sim: {stats['avg_similarity']:.1f}%  "
+                   f"Avg DTW: {stats['avg_dtw_cost']:.3f}  "
+                   f"Avg Time: {stats['avg_time']:.1f}s")
+        put_text_with_bg(frame, avg_txt, (w // 2 + 20, h - 40),
+                         font_scale=0.48, color=CYAN)
+
+    # Key hints
+    put_text_with_bg(frame, "E=cycle mode  R=restart",
+                     (w - 230, h - 20), font_scale=0.48, color=YELLOW)
+
+    # Log file path tip (top-right, small)
+    log_info = f"Log: {stats.get('log_path', 'eval_logs/attempts.csv')}"
+    put_text_with_bg(frame, log_info, (w - 420, bar_h + 12),
+                     font_scale=0.38, color=WHITE, bg=(20, 20, 20))
+
+
 _HUD_DRAWERS = [draw_normal_hud, draw_math_hud, draw_simon_hud,
-                draw_liveness_hud, draw_sequential_hud, draw_touch_test_hud]
+                draw_liveness_hud, draw_sequential_hud, draw_touch_test_hud,
+                draw_shape_eval_hud]
 
 
 # ── Main loop ───────────────────────────────────────────────────────
@@ -758,6 +925,9 @@ def run():
             elif key == ord("r"):
                 gm.restart()
                 print(f"{gm.mode_name} restarted!")
+            elif key == ord("e") and gm.current_mode == 6:
+                gm.shape_eval.cycle_mode()
+                print(f"Eval mode: {gm.shape_eval.eval_mode.label}")
 
     cap.release()
     cv2.destroyAllWindows()

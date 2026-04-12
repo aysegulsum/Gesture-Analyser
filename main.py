@@ -31,6 +31,7 @@ from gesture_session import GestureSession, SessionState
 from math_session import MathSession, MathState
 from simon_session import SimonSaysGame, SimonState
 from liveness_session import LivenessChallenge, LivenessState, CmdType
+from shape_tracer import TracerState
 from sequential_session import SequentialSession, SeqState, StepResult
 from finger_touch_session import FingerTouchSession, TouchTestState
 
@@ -339,6 +340,55 @@ def _draw_verification_bar(frame, pct, y=55):
     cv2.putText(frame, label, (x_start + (bar_w - tw) // 2, y + 17), font, 0.55, WHITE, 1)
 
 
+def _draw_shape_template(frame, waypoints, w: int, h: int) -> None:
+    """Draw the target shape guide as a semi-transparent white polyline.
+
+    The start waypoint is highlighted with a cyan circle and 'START' label
+    so the user knows where to begin their trace.
+    """
+    if len(waypoints) < 2:
+        return
+    pts = [(int(x * w), int(y * h)) for x, y in waypoints]
+
+    # Semi-transparent overlay so the template doesn't obscure the hands.
+    overlay = frame.copy()
+    for i in range(1, len(pts)):
+        cv2.line(overlay, pts[i - 1], pts[i], (200, 200, 200), 3, lineType=cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    # Redraw solid on top so it's crisp.
+    for i in range(1, len(pts)):
+        cv2.line(frame, pts[i - 1], pts[i], (200, 200, 200), 2, lineType=cv2.LINE_AA)
+
+    # Start marker
+    sx, sy = pts[0]
+    cv2.circle(frame, (sx, sy), 9, CYAN, -1)
+    cv2.putText(frame, "START", (sx + 12, sy + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, CYAN, 1, cv2.LINE_AA)
+
+
+def _draw_traced_path(frame, traced, w: int, h: int) -> None:
+    """Draw the user's recorded trace as a colour-shifting polyline.
+
+    Colour transitions cyan → magenta along the path so direction is
+    immediately visible.  The current fingertip position is marked with a
+    bright white dot.
+    """
+    if len(traced) < 2:
+        return
+    pts = [(int(x * w), int(y * h)) for x, y in traced]
+    total = len(pts)
+    for i in range(1, total):
+        t = i / total
+        r = int(200 * t)
+        g = int(220 * (1 - t))
+        b = 255
+        cv2.line(frame, pts[i - 1], pts[i], (b, g, r), 3, lineType=cv2.LINE_AA)
+    # Live fingertip dot
+    cv2.circle(frame, pts[-1], 8, WHITE, -1)
+    cv2.circle(frame, pts[-1], 8, CYAN,  2)
+
+
 def draw_liveness_hud(frame, gm: GameManager, hands):
     lv = gm.liveness
     h, w = frame.shape[:2]
@@ -352,6 +402,13 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
     # Air-drawing canvas (behind all text).
     if lv.is_drawing_cmd and ls == LivenessState.ACTIVE:
         _draw_air_canvas(frame, lv.drawing_path, w, h)
+
+    # Shape tracing canvas (template guide + live trace, always behind text).
+    if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+        st = lv.shape_tracer
+        _draw_shape_template(frame, st.template_waypoints, w, h)
+        if st.state in (TracerState.DRAWING, TracerState.VERIFIED, TracerState.FAILED):
+            _draw_traced_path(frame, st.traced_path, w, h)
 
     # -- Verification score bar (top) -------------------------------------
     _draw_verification_bar(frame, lv.verification_pct, y=10)
@@ -378,9 +435,18 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
         if lv.is_drawing_cmd:
             _draw_air_canvas(frame, lv.drawing_path, w, h)
         put_text_centered(frame, "VERIFIED!", h // 2 - 20, font_scale=1.4, color=GREEN, thickness=3)
+        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+            pct = lv.shape_tracer.similarity_pct
+            s_color = GREEN if pct >= 70 else YELLOW if pct >= 40 else RED
+            put_text_centered(frame, f"Similarity: {pct:.0f}%  |  DTW cost: {lv.shape_tracer.dtw_cost:.3f}",
+                              h // 2 + 25, font_scale=0.65, color=s_color)
     elif ls == LivenessState.FAILED:
         put_text_centered(frame, "FAILED!", h // 2 - 20, font_scale=1.4, color=RED, thickness=3)
-        put_text_centered(frame, "Next challenge incoming...", h // 2 + 30, font_scale=0.7, color=YELLOW)
+        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+            pct = lv.shape_tracer.similarity_pct
+            put_text_centered(frame, f"Similarity: {pct:.0f}%  (need ≥ 0% DTW ≤ 0.25)",
+                              h // 2 + 25, font_scale=0.6, color=YELLOW)
+        put_text_centered(frame, "Next challenge incoming...", h // 2 + 55, font_scale=0.7, color=YELLOW)
     else:
         cmd_color = ORANGE if ls == LivenessState.DEBOUNCE else CYAN
         put_text_centered(frame, lv.command_label, h // 2 - 30, font_scale=1.0, color=cmd_color, thickness=2)
@@ -408,6 +474,25 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
             pts = lv.drawing_point_count
             hint = f"Drawing... ({pts} pts) - close fist to finish" if pts > 0 else "Extend index finger and draw"
             put_text_with_bg(frame, hint, (20, h - 125), font_scale=0.55, color=MAGENTA)
+
+        # Shape tracing live feedback.
+        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+            st = lv.shape_tracer
+            put_text_centered(frame, lv.shape_trace_label, h // 2 - 30,
+                              font_scale=1.0, color=CYAN, thickness=2)
+            if st.state == TracerState.WAITING:
+                put_text_centered(frame, "Extend index finger over START to begin",
+                                  h // 2 + 15, font_scale=0.6, color=YELLOW)
+            elif st.state == TracerState.DRAWING:
+                remaining = st.time_remaining
+                t_color   = RED if remaining < 2 else YELLOW if remaining < 4 else WHITE
+                put_text_with_bg(frame, f"Drawing... {st.point_count} pts | {remaining:.1f}s",
+                                 (20, h - 125), font_scale=0.58, color=t_color)
+                put_text_centered(frame, "Close fist to finish",
+                                  h // 2 + 15, font_scale=0.6, color=ORANGE)
+            elif st.state == TracerState.VERIFYING:
+                put_text_centered(frame, "Analysing trace...",
+                                  h // 2 + 15, font_scale=0.7, color=YELLOW)
 
     status_color = GREEN if ls == LivenessState.SUCCESS else RED if ls == LivenessState.FAILED else YELLOW
     put_text_with_bg(frame, lv.status_label, (20, h - 90), font_scale=0.7, color=status_color)

@@ -33,6 +33,7 @@ from hand_tracker import HandResult
 from gesture_validator import GestureValidator, depth_proxy, is_finger_open, Finger, hand_scale, _euclidean, _LM
 from motion_analyzer import WaveDetector, ShapeRecognizer
 from anti_spoof import AntiSpoofAnalyzer, SpoofResult
+from finger_touch_detector import FingerTouchDetector, TouchCommand
 
 
 # ── Command definitions ─────────────────────────────────────────────
@@ -47,6 +48,7 @@ class CmdType(Enum):
     FINGER_TAP = auto()
     HAND_FLIP = auto()
     PEEK_A_BOO = auto()
+    FINGER_TOUCH = auto()  # validated touch with Z-axis check + 10-frame hold
 
 
 @dataclass(frozen=True)
@@ -94,7 +96,24 @@ _ADVANCED_CMDS = [
     Command("PEEK-A-BOO! (HIDE THEN SHOW)", CmdType.PEEK_A_BOO),
 ]
 
-ALL_COMMANDS = _GESTURE_CMDS + _SPATIAL_CMDS + _MOTION_CMDS + _ADVANCED_CMDS
+# ── Finger Touch commands (Z-validated, 10-frame hold) ───────────────
+# These replace the simpler FINGER_TAP for challenges that require the
+# full 3-layer protection (bbox normalisation + Z-axis + frame hold).
+
+_TOUCH_CMDS = [
+    Command("PINCH: THUMB + INDEX",   CmdType.FINGER_TOUCH,
+            extra={"touch_cmd": TouchCommand.THUMB_TO_INDEX}),
+    Command("PINCH: THUMB + MIDDLE",  CmdType.FINGER_TOUCH,
+            extra={"touch_cmd": TouchCommand.THUMB_TO_MIDDLE}),
+    Command("PINCH: THUMB + RING",    CmdType.FINGER_TOUCH,
+            extra={"touch_cmd": TouchCommand.THUMB_TO_RING}),
+    Command("PINCH: THUMB + PINKY",   CmdType.FINGER_TOUCH,
+            extra={"touch_cmd": TouchCommand.THUMB_TO_PINKY}),
+    Command("TOUCH BOTH THUMBS!",     CmdType.FINGER_TOUCH,
+            extra={"touch_cmd": TouchCommand.DOUBLE_THUMB_TOUCH}),
+]
+
+ALL_COMMANDS = _GESTURE_CMDS + _SPATIAL_CMDS + _MOTION_CMDS + _ADVANCED_CMDS + _TOUCH_CMDS
 
 # Number of challenges to complete for 100% verification.
 CHALLENGES_FOR_FULL_SCORE = 5
@@ -174,6 +193,9 @@ class LivenessChallenge:
     _peekaboo_phase: int = field(init=False, default=0)  # 0=waiting hide, 1=hidden, waiting show
     _peekaboo_hidden_at: Optional[float] = field(init=False, default=None)
 
+    # Finger touch state (FINGER_TOUCH commands)
+    _touch_detector: Optional[FingerTouchDetector] = field(init=False, default=None)
+
     def __post_init__(self):
         self._validator = GestureValidator(smoothing_window=self.smoothing_window)
         self._wave = WaveDetector(buffer_size=40, min_swing=0.10,
@@ -213,6 +235,16 @@ class LivenessChallenge:
         self._wave.reset()
         self._shape.reset()
 
+        # Create a fresh touch detector for FINGER_TOUCH challenges.
+        if self.current_cmd.cmd_type == CmdType.FINGER_TOUCH:
+            touch_cmd = self.current_cmd.extra["touch_cmd"]
+            self._touch_detector = FingerTouchDetector(
+                command=touch_cmd,
+                verify_frames=10,
+            )
+        else:
+            self._touch_detector = None
+
     @property
     def _effective_time_limit(self) -> float:
         ct = self.current_cmd.cmd_type
@@ -220,6 +252,8 @@ class LivenessChallenge:
             return self.time_limit + 3.0
         if ct in (CmdType.WAVE, CmdType.HAND_FLIP, CmdType.PEEK_A_BOO):
             return self.time_limit + 2.0
+        if ct == CmdType.FINGER_TOUCH:
+            return self.time_limit + 1.0
         return self.time_limit
 
     @property
@@ -405,9 +439,15 @@ class LivenessChallenge:
                 self._was_drawing = False
             return self.state
 
-        # Finger tap.
+        # Finger tap (simple, immediate).
         if ct == CmdType.FINGER_TAP:
             if should_process and self._finger_tap_matched(hands):
+                self._succeed(now)
+                return self.state
+
+        # Finger touch (Z-validated, 10-frame hold).
+        if ct == CmdType.FINGER_TOUCH and self._touch_detector is not None:
+            if self._touch_detector.update(hands):
                 self._succeed(now)
                 return self.state
 
@@ -528,6 +568,24 @@ class LivenessChallenge:
     @property
     def is_wave_cmd(self) -> bool:
         return self.current_cmd.cmd_type == CmdType.WAVE
+
+    @property
+    def is_touch_cmd(self) -> bool:
+        return self.current_cmd.cmd_type == CmdType.FINGER_TOUCH
+
+    @property
+    def touch_frame_count(self) -> int:
+        """Current consecutive-frame count toward the 10-frame touch hold."""
+        if self._touch_detector is None:
+            return 0
+        return self._touch_detector.consecutive_frames
+
+    @property
+    def touch_frame_progress(self) -> float:
+        """0.0-1.0 fraction of the 10-frame requirement met (for progress bars)."""
+        if self._touch_detector is None:
+            return 0.0
+        return self._touch_detector.progress
 
     @property
     def challenge_progress_text(self) -> str:

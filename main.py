@@ -32,6 +32,7 @@ from math_session import MathSession, MathState
 from simon_session import SimonSaysGame, SimonState
 from liveness_session import LivenessChallenge, LivenessState, CmdType
 from sequential_session import SequentialSession, SeqState, StepResult
+from finger_touch_session import FingerTouchSession, TouchTestState
 
 
 # -- colour palette -------------------------------------------------------
@@ -44,7 +45,7 @@ MAGENTA = (200, 50, 255)
 ORANGE = (0, 160, 255)
 DARK_BG = (40, 40, 40)
 
-MODE_NAMES = ["Normal", "Math", "Simon", "Liveness", "Sequential"]
+MODE_NAMES = ["Normal", "Math", "Simon", "Liveness", "Sequential", "Touch Test"]
 
 
 # ── GameManager ─────────────────────────────────────────────────────
@@ -80,6 +81,9 @@ class GameManager:
             hold_seconds=1.0, pause_after_step=1.0,
             depth_threshold=0.20, smoothing_window=7,
         )
+        self.touch_test = FingerTouchSession(
+            verify_frames=10, pause_after_success=1.5,
+        )
 
         self.hands_present = False
 
@@ -97,6 +101,8 @@ class GameManager:
             self.liveness.reset()
         elif self.current_mode == 4:
             self.sequential.reset()
+        elif self.current_mode == 5:
+            self.touch_test.reset()
 
     def restart(self):
         if self.current_mode == 0:
@@ -109,6 +115,8 @@ class GameManager:
             self.liveness.reset()
         elif self.current_mode == 4:
             self.sequential.reset()
+        elif self.current_mode == 5:
+            self.touch_test.reset()
 
     def update(self, hands: list[HandResult]):
         """Global hand-presence check, then delegate to active mode.
@@ -131,6 +139,8 @@ class GameManager:
             self.liveness.update(hands)
         elif self.current_mode == 4:
             self.sequential.update(hands)
+        elif self.current_mode == 5:
+            self.touch_test.update(hands)
 
 
 # ── Drawing utilities ───────────────────────────────────────────────
@@ -384,6 +394,15 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
             rev_color = GREEN if rev >= 2 else YELLOW if rev >= 1 else WHITE
             put_text_with_bg(frame, f"Waves: {rev}/2", (20, h - 125), font_scale=0.65, color=rev_color)
 
+        # Finger touch hold counter + progress bar.
+        if lv.is_touch_cmd:
+            frames = lv.touch_frame_count
+            touch_color = GREEN if frames >= 8 else YELLOW if frames >= 4 else WHITE
+            put_text_with_bg(frame, f"Hold: {frames}/10 frames", (20, h - 125),
+                             font_scale=0.65, color=touch_color)
+            draw_progress_bar(frame, lv.touch_frame_progress, y=h - 108,
+                              color_full=GREEN, color_fill=YELLOW)
+
         # Drawing hint.
         if lv.is_drawing_cmd:
             pts = lv.drawing_point_count
@@ -510,7 +529,79 @@ def draw_sequential_hud(frame, gm: GameManager, hands):
             y_off += 28
 
 
-_HUD_DRAWERS = [draw_normal_hud, draw_math_hud, draw_simon_hud, draw_liveness_hud, draw_sequential_hud]
+def draw_touch_test_hud(frame, gm: GameManager, hands):
+    tt = gm.touch_test
+    h, w = frame.shape[:2]
+    ts = tt.state
+
+    # -- Header -----------------------------------------------------------
+    put_text_centered(frame, "FINGER TOUCH TEST", 32, font_scale=0.9, color=CYAN, thickness=2)
+
+    # -- Checklist (left column) -----------------------------------------
+    checklist_x = 20
+    checklist_y = 60
+    for i, (_, label, passed) in enumerate(tt.all_commands):
+        is_current = (i == tt.current_idx) and ts != TouchTestState.COMPLETE
+        if passed:
+            marker = "[OK]"
+            color  = GREEN
+        elif is_current:
+            marker = "[ > ]"
+            color  = YELLOW
+        else:
+            marker  = "[   ]"
+            color   = WHITE
+        put_text_with_bg(frame, f"{marker} {label}", (checklist_x, checklist_y + i * 34),
+                         font_scale=0.55, color=color)
+
+    # -- Centre: current command + hold progress -------------------------
+    mid_y = h // 2
+
+    if ts == TouchTestState.COMPLETE:
+        put_text_centered(frame, "ALL 5 COMBINATIONS PASSED!", mid_y - 30,
+                          font_scale=1.1, color=GREEN, thickness=3)
+        put_text_centered(frame, f"Passed: {tt.passed_count}/5", mid_y + 20,
+                          font_scale=0.8, color=WHITE)
+        put_text_centered(frame, "Press R to restart", mid_y + 60,
+                          font_scale=0.7, color=YELLOW)
+        return
+
+    if ts == TouchTestState.SUCCESS:
+        put_text_centered(frame, "VERIFIED!", mid_y - 20,
+                          font_scale=1.3, color=GREEN, thickness=3)
+        put_text_centered(frame, "Next command incoming...", mid_y + 25,
+                          font_scale=0.7, color=YELLOW)
+    else:
+        # Active: show current command and hold counter
+        put_text_centered(frame, tt.progress_text, mid_y - 65,
+                          font_scale=0.7, color=CYAN)
+        put_text_centered(frame, tt.command_label, mid_y - 30,
+                          font_scale=0.85, color=ORANGE, thickness=2)
+
+        frames    = tt.frame_count
+        progress  = tt.hold_progress
+        f_color   = GREEN if frames >= 8 else YELLOW if frames >= 4 else WHITE
+        put_text_centered(frame, f"Hold: {frames} / {tt.verify_frames} frames",
+                          mid_y + 20, font_scale=0.75, color=f_color, thickness=2)
+        draw_progress_bar(frame, progress, y=mid_y + 38, color_full=GREEN, color_fill=YELLOW)
+
+        # Hint for double-thumb command
+        if "BOTH THUMBS" in tt.command_label:
+            put_text_centered(frame, "(show both hands, bring thumbs together)",
+                              mid_y + 75, font_scale=0.55, color=WHITE)
+        else:
+            put_text_centered(frame, "(use any hand)", mid_y + 75,
+                              font_scale=0.55, color=WHITE)
+
+    # -- Summary bar (bottom) --------------------------------------------
+    put_text_with_bg(frame, f"Passed: {tt.passed_count}/5", (20, h - 90),
+                     font_scale=0.7, color=GREEN, thickness=2)
+    put_text_with_bg(frame, "R = restart", (w - 170, h - 90),
+                     font_scale=0.6, color=YELLOW)
+
+
+_HUD_DRAWERS = [draw_normal_hud, draw_math_hud, draw_simon_hud,
+                draw_liveness_hud, draw_sequential_hud, draw_touch_test_hud]
 
 
 # ── Main loop ───────────────────────────────────────────────────────

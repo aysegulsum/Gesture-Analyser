@@ -45,6 +45,7 @@ import math
 from enum import Enum, auto
 
 from gesture_validator import _euclidean, _LM, finger_ratio, is_fist, Finger
+from app_config import cfg
 
 
 # ── Command catalogue ────────────────────────────────────────────────
@@ -74,18 +75,15 @@ _BYSTANDER_FINGERS: dict[TouchCommand, list[Finger]] = {
     TouchCommand.THUMB_TO_PINKY:  [Finger.INDEX,  Finger.MIDDLE, Finger.RING],
 }
 
-# Default detector parameters
-_DEFAULT_VERIFY_FRAMES   = 10    # frames of continuous touch required
-_DEFAULT_TOUCH_THRESHOLD = 0.28  # fraction of bbox diagonal
-_DEFAULT_Z_MAX_DIFF      = 0.04  # maximum allowed Z-depth gap between tips
+# Default detector parameters — sourced from the central config so they
+# update automatically when config.yaml is changed.
+_DEFAULT_VERIFY_FRAMES   = cfg.touch.verify_frames    # frames of continuous touch required
+_DEFAULT_TOUCH_THRESHOLD = cfg.touch.threshold        # fraction of bbox diagonal
+_DEFAULT_Z_MAX_DIFF      = cfg.touch.z_max_diff       # maximum allowed Z-depth gap between tips
 
-# Bystander openness gate: finger_ratio must exceed this for at least one
-# bystander finger.  0.05 is deliberately low — it only filters a tight
-# fist where every bystander ratio is at or below zero.
-_BYSTANDER_OPEN_THRESH = 0.05
-
-# Minimum number of bystander fingers that must clear the threshold.
-_BYSTANDER_MIN_OPEN = 1
+# Bystander openness gate — see config.yaml [touch] section.
+_BYSTANDER_OPEN_THRESH = cfg.touch.bystander_open_thresh
+_BYSTANDER_MIN_OPEN    = cfg.touch.bystander_min_open
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────

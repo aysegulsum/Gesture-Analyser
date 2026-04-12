@@ -23,6 +23,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+from app_config import cfg
+
 _MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
 
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -41,7 +43,12 @@ class HandResult:
 
 
 # ── CLAHE contrast enhancer (created once, reused) ──────────────────
-_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+# Parameters sourced from config so operators can tune contrast enhancement
+# for different lighting environments without touching source code.
+_clahe = cv2.createCLAHE(
+    clipLimit=cfg.tracker.clahe_clip_limit,
+    tileGridSize=(cfg.tracker.clahe_tile_size, cfg.tracker.clahe_tile_size),
+)
 
 
 def _enhance_frame(bgr: np.ndarray) -> np.ndarray:

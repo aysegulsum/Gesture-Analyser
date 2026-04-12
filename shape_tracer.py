@@ -85,6 +85,7 @@ import numpy as np
 
 from hand_tracker import HandResult
 from gesture_validator import hand_scale as _hs, is_finger_open, Finger, _LM
+from app_config import cfg
 
 
 # ── Shape catalogue ──────────────────────────────────────────────────
@@ -322,22 +323,17 @@ class TracerState(Enum):
     FAILED      = auto()  # timed out or DTW cost too high / too few points
 
 
-# Defaults used by ShapeTracerSession and by liveness_session integration
-#
-# DEFAULT_DRAW_TIME raised 10 → 12 s: gives users a comfortable margin
-# especially after the 3 s instruction + 0.5 s position-hold preamble.
-# The timer only starts once TRACING begins, so no time is "wasted".
-#
-# DEFAULT_MIN_HS lowered 0.10 → 0.05: the original value rejected hands
-# that were slightly further from the camera than expected (Z-axis
-# flexibility).  0.05 still blocks hands that are far out of frame while
-# accommodating a much wider range of natural user distances.
-DEFAULT_DRAW_TIME    = 12.0  # seconds per trace attempt (timer starts at TRACING)
-DEFAULT_DTW_THRESH   = 0.25  # normalised per-point DTW cost threshold
-DEFAULT_RESAMPLE_N   = 50    # number of points for DTW comparison
-DEFAULT_MIN_HS       = 0.05  # minimum hand_scale — loosened for Z-axis flexibility
-DEFAULT_POS_HOLD     = 0.50  # seconds to hold at start point before TRACING
-DEFAULT_INSTRUCT_TIME = 3.0  # seconds to show instruction overlay
+# Defaults used by ShapeTracerSession and by liveness_session integration.
+# Module-level constants — sourced from the central config so a single
+# edit to config.yaml propagates here and to all importers automatically.
+# (config.yaml: shape_trace.draw_time=12.0, shape_trace.min_hand_scale=0.05
+#  reflect the spoof-fix tuning landed in fix/liveness-shape-trace-spoof-false-positive)
+DEFAULT_DRAW_TIME     = cfg.shape_trace.draw_time      # seconds per trace attempt
+DEFAULT_DTW_THRESH    = cfg.shape_trace.dtw_threshold  # normalised per-point DTW cost threshold
+DEFAULT_RESAMPLE_N    = cfg.shape_trace.resample_n     # number of points for DTW comparison
+DEFAULT_MIN_HS        = cfg.shape_trace.min_hand_scale # minimum hand_scale for depth liveness gate
+DEFAULT_POS_HOLD      = cfg.shape_trace.pos_hold       # seconds to hold at start point before TRACING
+DEFAULT_INSTRUCT_TIME = cfg.shape_trace.instruct_time  # seconds to show instruction overlay
 
 
 @dataclass

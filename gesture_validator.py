@@ -31,6 +31,8 @@ import math
 from dataclasses import dataclass
 from enum import IntEnum
 
+from app_config import cfg
+
 
 class Finger(IntEnum):
     THUMB = 0
@@ -120,7 +122,11 @@ def is_finger_open(landmarks, hand_label: str, finger_name: Finger,
                    open_threshold: float | None = None) -> bool:
     """Stateless single-shot check (no hysteresis / smoothing)."""
     if open_threshold is None:
-        open_threshold = 0.75 if finger_name == Finger.THUMB else 0.20
+        open_threshold = (
+            cfg.gesture.thumb_open_threshold
+            if finger_name == Finger.THUMB
+            else cfg.gesture.finger_open_threshold
+        )
     return finger_ratio(landmarks, finger_name) > open_threshold
 
 
@@ -128,7 +134,11 @@ def is_fist(landmarks) -> bool:
     """Return True if all fingers score below their open threshold."""
     for finger in Finger:
         score = finger_ratio(landmarks, finger)
-        th = 0.75 if finger == Finger.THUMB else 0.20
+        th = (
+            cfg.gesture.thumb_open_threshold
+            if finger == Finger.THUMB
+            else cfg.gesture.finger_open_threshold
+        )
         if score > th:
             return False
     return True
@@ -143,7 +153,11 @@ def finger_debug_info(landmarks, handedness: str = "Right") -> dict[Finger, tupl
         tip_id = FINGER_TIP_IDS[finger]
         ratio = finger_ratio(landmarks, finger)
         tw = _tip_wrist_ratio(landmarks, finger)
-        open_th = 0.75 if finger == Finger.THUMB else 0.20
+        open_th = (
+            cfg.gesture.thumb_open_threshold
+            if finger == Finger.THUMB
+            else cfg.gesture.finger_open_threshold
+        )
         info[finger] = (tip_id, ratio > open_th, ratio, tw)
     return info
 
@@ -340,18 +354,20 @@ class GestureValidator:
 
     def __init__(
         self,
-        ewma_alpha: float = 0.35,
-        finger_open_th: float = 0.20,
-        finger_close_th: float = 0.12,
-        thumb_open_th: float = 0.75,
-        thumb_close_th: float = 0.60,
+        ewma_alpha: float | None = None,
+        finger_open_th: float | None = None,
+        finger_close_th: float | None = None,
+        thumb_open_th: float | None = None,
+        thumb_close_th: float | None = None,
         smoothing_window: int = 7,  # legacy, ignored
     ):
-        self._alpha = ewma_alpha
-        self._finger_open = finger_open_th
-        self._finger_close = finger_close_th
-        self._thumb_open = thumb_open_th
-        self._thumb_close = thumb_close_th
+        # Resolve None → config default so callers may pass explicit overrides
+        # or omit parameters entirely to get the centrally configured values.
+        self._alpha        = ewma_alpha       if ewma_alpha       is not None else cfg.gesture.ewma_alpha
+        self._finger_open  = finger_open_th  if finger_open_th  is not None else cfg.gesture.finger_open_threshold
+        self._finger_close = finger_close_th if finger_close_th is not None else cfg.gesture.finger_close_threshold
+        self._thumb_open   = thumb_open_th   if thumb_open_th   is not None else cfg.gesture.thumb_open_threshold
+        self._thumb_close  = thumb_close_th  if thumb_close_th  is not None else cfg.gesture.thumb_close_threshold
 
         self._hysteresis: dict[str, _HysteresisState] = {}
         self._smoothers: dict[str, _EWMASmoother] = {}

@@ -29,6 +29,7 @@ import time
 import cv2
 import numpy as np
 
+from app_config import cfg
 from hand_tracker import HandTracker, HandResult, draw_landmarks
 from gesture_session import GestureSession, SessionState
 from math_session import MathSession, MathState
@@ -67,30 +68,38 @@ class GameManager:
 
         self.gesture = GestureSession(
             stability_seconds=1.0, pause_after_success=2.0,
-            targets=list(range(1, 11)), smoothing_window=7,
+            targets=list(range(1, 11)),
+            smoothing_window=cfg.gesture.smoothing_window,
         )
         self.math = MathSession(
-            stability_seconds=2.0, pause_after_success=1.5,
-            game_duration=60.0, smoothing_window=7,
+            stability_seconds=cfg.math.stability_seconds,
+            pause_after_success=cfg.math.pause_after_success,
+            game_duration=cfg.math.game_duration,
+            smoothing_window=cfg.math.smoothing_window,
         )
         self.liveness = LivenessChallenge(
-            time_limit=4.0, debounce_seconds=0.5,
-            area_change_threshold=0.20, pause_after_result=1.5,
-            smoothing_window=7,
+            time_limit=cfg.liveness.time_limit,
+            debounce_seconds=cfg.liveness.debounce_seconds,
+            area_change_threshold=cfg.liveness.area_change_threshold,
+            pause_after_result=cfg.liveness.pause_after_result,
+            smoothing_window=cfg.liveness.smoothing_window,
         )
         self.sequential = SequentialSession(
-            hold_seconds=1.0, pause_after_step=1.0,
-            depth_threshold=0.20, smoothing_window=7,
+            hold_seconds=cfg.sequential.hold_seconds,
+            pause_after_step=cfg.sequential.pause_after_step,
+            depth_threshold=cfg.sequential.depth_threshold,
+            smoothing_window=cfg.sequential.smoothing_window,
         )
         self.touch_test = FingerTouchSession(
-            verify_frames=10, pause_after_success=1.5,
+            verify_frames=cfg.touch_test.verify_frames,
+            pause_after_success=cfg.touch_test.pause_after_success,
         )
         _evaluator = TracingEvaluator(log_dir="eval_logs")
         self.shape_eval = ShapeTraceEvalSession(
             evaluator=_evaluator,
             eval_mode=EvalMode.HUMAN_TEST,
-            dtw_threshold=0.25,
-            auto_advance=True,
+            dtw_threshold=cfg.shape_eval.dtw_threshold,
+            auto_advance=cfg.shape_eval.auto_advance,
         )
 
         self.hands_present = False
@@ -1042,9 +1051,9 @@ def run():
 
     tracker = HandTracker(
         max_num_hands=2,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
-        max_lost_frames=2,
+        min_detection_confidence=cfg.tracker.detection_confidence,
+        min_tracking_confidence=cfg.tracker.tracking_confidence,
+        max_lost_frames=cfg.tracker.max_lost_frames,
     )
     gm = GameManager()
 

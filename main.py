@@ -3,11 +3,13 @@ Desktop Demo -- v5 Hardened with GameManager
 =============================================
 Run with:  python main.py
 
-Four modes, cycle with **m** key:
-  1. [Normal]    Show N fingers to match the prompt (1-10).
-  2. [Math]      Solve arithmetic with fingers (60s timer).
-  3. [Simon]     Memorise & replicate a gesture sequence.
-  4. [Liveness]  Fast-response single-command challenge (4s window).
+Six modes, cycle with **m** key:
+  1. [Normal]     Show N fingers to match the prompt (1-10).
+  2. [Math]       Solve arithmetic with fingers (60s timer).
+  3. [Liveness]   Fast-response single-command challenge (4s window).
+  4. [Sequential] Complete a series of timed gesture steps.
+  5. [Touch Test] Verify all five finger-touch combinations.
+  6. [Shape Eval] Dynamic shape-tracing liveness evaluation.
 
 Press **r** to restart the current game.
 Press **q** or **Esc** to quit.
@@ -30,7 +32,6 @@ import numpy as np
 from hand_tracker import HandTracker, HandResult, draw_landmarks
 from gesture_session import GestureSession, SessionState
 from math_session import MathSession, MathState
-from simon_session import SimonSaysGame, SimonState
 from liveness_session import LivenessChallenge, LivenessState, CmdType
 from shape_tracer import TracerState
 from sequential_session import SequentialSession, SeqState, StepResult
@@ -49,7 +50,7 @@ MAGENTA = (200, 50, 255)
 ORANGE = (0, 160, 255)
 DARK_BG = (40, 40, 40)
 
-MODE_NAMES = ["Normal", "Math", "Simon", "Liveness", "Sequential", "Touch Test", "Shape Eval"]
+MODE_NAMES = ["Normal", "Math", "Liveness", "Sequential", "Touch Test", "Shape Eval"]
 
 
 # ── GameManager ─────────────────────────────────────────────────────
@@ -71,10 +72,6 @@ class GameManager:
         self.math = MathSession(
             stability_seconds=2.0, pause_after_success=1.5,
             game_duration=60.0, smoothing_window=7,
-        )
-        self.simon = SimonSaysGame(
-            sequence_length=4, show_duration=2.0,
-            hold_seconds=1.5, global_timeout=15.0, smoothing_window=7,
         )
         self.liveness = LivenessChallenge(
             time_limit=4.0, debounce_seconds=0.5,
@@ -107,14 +104,12 @@ class GameManager:
         if self.current_mode == 1:
             self.math.reset()
         elif self.current_mode == 2:
-            self.simon.reset()
-        elif self.current_mode == 3:
             self.liveness.reset()
-        elif self.current_mode == 4:
+        elif self.current_mode == 3:
             self.sequential.reset()
-        elif self.current_mode == 5:
+        elif self.current_mode == 4:
             self.touch_test.reset()
-        elif self.current_mode == 6:
+        elif self.current_mode == 5:
             self.shape_eval.reset()
 
     def restart(self):
@@ -123,14 +118,12 @@ class GameManager:
         elif self.current_mode == 1:
             self.math.reset()
         elif self.current_mode == 2:
-            self.simon.next_round()
-        elif self.current_mode == 3:
             self.liveness.reset()
-        elif self.current_mode == 4:
+        elif self.current_mode == 3:
             self.sequential.reset()
-        elif self.current_mode == 5:
+        elif self.current_mode == 4:
             self.touch_test.reset()
-        elif self.current_mode == 6:
+        elif self.current_mode == 5:
             self.shape_eval.reset()
 
     def update(self, hands: list[HandResult]):
@@ -149,14 +142,12 @@ class GameManager:
         elif self.current_mode == 1:
             self.math.update(hands)
         elif self.current_mode == 2:
-            self.simon.update(hands)
-        elif self.current_mode == 3:
             self.liveness.update(hands)
-        elif self.current_mode == 4:
+        elif self.current_mode == 3:
             self.sequential.update(hands)
-        elif self.current_mode == 5:
+        elif self.current_mode == 4:
             self.touch_test.update(hands)
-        elif self.current_mode == 6:
+        elif self.current_mode == 5:
             self.shape_eval.update(hands)
 
 
@@ -267,61 +258,6 @@ def draw_math_hud(frame, gm: GameManager, hands):
     if total is not None:
         c = GREEN if total == ses.answer else WHITE
         put_text_with_bg(frame, f"Total: {total}", (20, y_off), font_scale=0.7, color=c, thickness=2)
-
-
-def draw_simon_hud(frame, gm: GameManager, hands):
-    simon = gm.simon
-    h, w = frame.shape[:2]
-    ss = simon.state
-
-    box_w, box_h, gap = 50, 30, 10
-    total_w = len(simon.sequence) * (box_w + gap) - gap
-    x_start = (w - total_w) // 2
-    y_box = 15
-
-    for i, _ in enumerate(simon.sequence):
-        x = x_start + i * (box_w + gap)
-        if ss == SimonState.SHOWING:
-            bg_col = MAGENTA if i == simon._show_index else (80, 80, 80) if i < simon._show_index else (50, 50, 50)
-        elif ss == SimonState.REPLICATING:
-            bg_col = GREEN if i < simon.current_step else YELLOW if i == simon.current_step else (80, 80, 80)
-        elif ss == SimonState.VERIFIED:
-            bg_col = GREEN
-        else:
-            bg_col = RED if i >= simon.current_step else GREEN
-        cv2.rectangle(frame, (x, y_box), (x + box_w, y_box + box_h), bg_col, -1)
-        cv2.rectangle(frame, (x, y_box), (x + box_w, y_box + box_h), WHITE, 1)
-        cv2.putText(frame, str(i + 1), (x + box_w // 2 - 5, y_box + box_h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
-
-    if ss == SimonState.SHOWING:
-        g = simon.showing_gesture
-        if g:
-            put_text_centered(frame, f"MEMORISE: {g.name}", h // 2 - 20, font_scale=1.1, color=MAGENTA, thickness=2)
-            draw_progress_bar(frame, simon.show_progress, y=h // 2 + 20, color_full=MAGENTA, color_fill=MAGENTA)
-            put_text_centered(frame, f"Step {simon._show_index + 1} of {len(simon.sequence)}", h // 2 + 65, font_scale=0.7, color=WHITE)
-    elif ss == SimonState.REPLICATING:
-        g = simon.current_target_gesture
-        if g:
-            put_text_centered(frame, simon.display_text, h // 2 - 20, font_scale=1.0, color=YELLOW, thickness=2)
-            draw_progress_bar(frame, simon.hold_progress, y=h // 2 + 20)
-        status_color = YELLOW if simon.hold_progress > 0 else WHITE
-        put_text_with_bg(frame, simon.status_label, (20, 80), font_scale=0.7, color=status_color)
-        remaining = simon.time_remaining
-        timer_color = RED if remaining < 5 else YELLOW if remaining < 10 else WHITE
-        put_text_with_bg(frame, f"Time: {remaining:.1f}s", (w - 200, 80), font_scale=0.8, color=timer_color, thickness=2)
-    elif ss == SimonState.VERIFIED:
-        put_text_centered(frame, "LIVENESS VERIFIED!", h // 2 - 10, font_scale=1.3, color=GREEN, thickness=3)
-        put_text_centered(frame, f"Rounds: {simon.rounds_completed}", h // 2 + 40, font_scale=0.8, color=WHITE)
-        put_text_centered(frame, "Press R for next round", h // 2 + 80, font_scale=0.7, color=YELLOW)
-    elif ss == SimonState.FAILED:
-        put_text_centered(frame, "VERIFICATION FAILED", h // 2 - 10, font_scale=1.3, color=RED, thickness=3)
-        put_text_centered(frame, "Press R to retry", h // 2 + 60, font_scale=0.7, color=YELLOW)
-
-    y_off = h - 60
-    for hand in hands:
-        count = simon._validator.count_fingers(hand.landmarks, hand.handedness)
-        put_text_with_bg(frame, f"{hand.handedness}: {count}", (20, y_off), font_scale=0.6)
-        y_off += 28
 
 
 def _draw_air_canvas(frame, path, w, h):
@@ -1105,7 +1041,7 @@ def draw_shape_eval_hud(frame, gm: GameManager, hands):
                      font_scale=0.38, color=WHITE, bg=(20, 20, 20))
 
 
-_HUD_DRAWERS = [draw_normal_hud, draw_math_hud, draw_simon_hud,
+_HUD_DRAWERS = [draw_normal_hud, draw_math_hud,
                 draw_liveness_hud, draw_sequential_hud, draw_touch_test_hud,
                 draw_shape_eval_hud]
 

@@ -1,18 +1,33 @@
 """
 Finger Touch Detector -- Liveness Challenge Module
 ===================================================
-Detects specific fingertip pinch gestures with three layers of protection:
+Detects specific fingertip pinch gestures with four layers of protection:
 
-  1. Normalized Euclidean distance
-       Distance between the two landmarks is divided by the hand bounding-box
-       diagonal, making the threshold invariant to hand size and camera distance.
+  1. Fist gate (NEW)
+       Immediately rejects the frame if the active hand is in a full fist.
+       In a fist all fingertips converge near the palm, so raw distance
+       checks between e.g. thumb-tip and index-tip can pass falsely.
+       Uses the proven ``is_fist()`` geometry from gesture_validator.
 
-  2. Z-axis depth validation
+  2. Bystander finger check (NEW)
+       For single-hand commands, at least one finger that is NOT part of
+       the touch pair must be sufficiently open.  This distinguishes a
+       genuine pinch (bystanders extended) from a semi-clenched fist
+       (all fingers curled together).
+
+  3. Normalized Euclidean distance
+       Distance between the two landmarks is divided by the hand bounding-
+       box diagonal, making the threshold invariant to hand size and camera
+       distance.
+
+  4. Z-axis depth validation (tightened)
        Rejects cases where one finger passes *behind* the other in 3D space.
        This blocks the common 2D spoofing attack where fingers look adjacent
-       in the image plane but are at very different depths.
+       in the image plane but are at very different depths.  The check is
+       applied before the distance gate so it doubles as an early exit for
+       fist-like poses where fingertip Z values diverge.
 
-  3. 10-frame consecutive hold requirement
+  5. 10-frame consecutive hold requirement
        A fleeting or accidental brush does not satisfy the challenge.
        The touch must be maintained for ``verify_frames`` (default 10)
        consecutive video frames before the gesture is marked 'Verified'.
@@ -29,7 +44,7 @@ Supported commands
 import math
 from enum import Enum, auto
 
-from gesture_validator import _euclidean, _LM
+from gesture_validator import _euclidean, _LM, finger_ratio, is_fist, Finger
 
 
 # ── Command catalogue ────────────────────────────────────────────────
@@ -50,10 +65,27 @@ _SINGLE_HAND_PAIRS: dict[TouchCommand, tuple[int, int]] = {
     TouchCommand.THUMB_TO_PINKY:  (_LM["THUMB_TIP"], _LM["PINKY_TIP"]),   # 4, 20
 }
 
+# Fingers that must NOT all be curled during a single-hand touch command.
+# At least one bystander must be open to distinguish pinch from fist.
+_BYSTANDER_FINGERS: dict[TouchCommand, list[Finger]] = {
+    TouchCommand.THUMB_TO_INDEX:  [Finger.MIDDLE, Finger.RING, Finger.PINKY],
+    TouchCommand.THUMB_TO_MIDDLE: [Finger.INDEX,  Finger.RING, Finger.PINKY],
+    TouchCommand.THUMB_TO_RING:   [Finger.INDEX,  Finger.MIDDLE, Finger.PINKY],
+    TouchCommand.THUMB_TO_PINKY:  [Finger.INDEX,  Finger.MIDDLE, Finger.RING],
+}
+
 # Default detector parameters
 _DEFAULT_VERIFY_FRAMES   = 10    # frames of continuous touch required
 _DEFAULT_TOUCH_THRESHOLD = 0.28  # fraction of bbox diagonal
 _DEFAULT_Z_MAX_DIFF      = 0.04  # maximum allowed Z-depth gap between tips
+
+# Bystander openness gate: finger_ratio must exceed this for at least one
+# bystander finger.  0.05 is deliberately low — it only filters a tight
+# fist where every bystander ratio is at or below zero.
+_BYSTANDER_OPEN_THRESH = 0.05
+
+# Minimum number of bystander fingers that must clear the threshold.
+_BYSTANDER_MIN_OPEN = 1
 
 
 # ── Geometry helpers ─────────────────────────────────────────────────
@@ -81,6 +113,29 @@ def _z_valid(lm_a, lm_b, z_max_diff: float) -> bool:
     close in the 2D image but are not actually touching.
     """
     return abs(lm_a.z - lm_b.z) <= z_max_diff
+
+
+def _bystanders_clear(landmarks, command: TouchCommand) -> bool:
+    """Return True when at least ``_BYSTANDER_MIN_OPEN`` non-touching fingers
+    are sufficiently extended to rule out a fist or semi-fist posture.
+
+    Logic
+    -----
+    In a genuine pinch the bystander fingers (those not involved in the
+    touch pair) stay relatively open because the hand must separate the
+    touching fingertips from the rest.  In a fist every finger curls, so
+    all bystander ``finger_ratio`` values are at or below zero.
+
+    We only require ``_BYSTANDER_MIN_OPEN`` (default 1) bystander to pass
+    the threshold, which accommodates people who naturally curl one or two
+    fingers when pinching.
+    """
+    bystanders = _BYSTANDER_FINGERS.get(command, [])
+    open_count = sum(
+        1 for f in bystanders
+        if finger_ratio(landmarks, f) > _BYSTANDER_OPEN_THRESH
+    )
+    return open_count >= _BYSTANDER_MIN_OPEN
 
 
 # ── Main detector class ──────────────────────────────────────────────
@@ -111,9 +166,9 @@ class FingerTouchDetector:
     def __init__(
         self,
         command: TouchCommand,
-        verify_frames: int  = _DEFAULT_VERIFY_FRAMES,
+        verify_frames: int   = _DEFAULT_VERIFY_FRAMES,
         touch_threshold: float = _DEFAULT_TOUCH_THRESHOLD,
-        z_max_diff: float   = _DEFAULT_Z_MAX_DIFF,
+        z_max_diff: float    = _DEFAULT_Z_MAX_DIFF,
     ):
         self.command         = command
         self.verify_frames   = verify_frames
@@ -125,22 +180,61 @@ class FingerTouchDetector:
     # -- Internal per-frame geometry checks ------------------------------
 
     def _check_single_hand(self, landmarks) -> bool:
-        """Evaluate touch for same-hand landmark pairs."""
+        """Evaluate touch for same-hand landmark pairs.
+
+        Validation pipeline
+        -------------------
+        Gate 1  — Fist detection
+            Reject immediately if the hand geometry matches a closed fist.
+            In a fist all finger_ratio scores are below their open threshold,
+            so ``is_fist()`` returns True and we bail out before any distance
+            arithmetic.  This is the primary fix for fist false-positives.
+
+        Gate 2  — Z-axis depth
+            The two touching tips must lie in the same depth plane.  A fist
+            where fingertips pass over each other at different depths often
+            survives the 2-D distance check but fails here.
+
+        Gate 3  — Normalised Euclidean distance
+            Classic proximity check, scale-invariant via bbox diagonal.
+
+        Gate 4  — Bystander finger check
+            At least one finger that is NOT in the touch pair must be
+            measurably open.  This catches semi-fist postures that slip past
+            Gate 1 (e.g. four fingers curled, thumb tucked slightly less).
+        """
+        # Gate 1: reject full fists outright
+        if is_fist(landmarks):
+            return False
+
         tip_a_id, tip_b_id = _SINGLE_HAND_PAIRS[self.command]
         lm_a = landmarks[tip_a_id]
         lm_b = landmarks[tip_b_id]
 
-        # Layer 2: Z-axis anti-spoof gate
+        # Gate 2: Z-axis anti-spoof (applied before distance to short-circuit)
         if not _z_valid(lm_a, lm_b, self.z_max_diff):
             return False
 
-        # Layer 1: Normalised Euclidean distance
+        # Gate 3: Normalised Euclidean distance
         scale = _bbox_scale(landmarks)
         dist  = _euclidean(lm_a, lm_b) / scale
-        return dist < self.touch_threshold
+        if dist >= self.touch_threshold:
+            return False
+
+        # Gate 4: at least one bystander finger must be open
+        if not _bystanders_clear(landmarks, self.command):
+            return False
+
+        return True
 
     def _check_double_thumb(self, hands) -> bool:
-        """Evaluate DOUBLE_THUMB_TOUCH across left and right hands."""
+        """Evaluate DOUBLE_THUMB_TOUCH across left and right hands.
+
+        In addition to the existing distance + Z checks, both hands must
+        individually pass ``is_fist()`` negation.  This rejects the case
+        where a person holds two fists together with their thumbs tucked,
+        which could otherwise pass the thumb-tip proximity test.
+        """
         left_lm = right_lm = None
         for h in hands:
             if h.handedness == "Left":
@@ -151,15 +245,19 @@ class FingerTouchDetector:
         if left_lm is None or right_lm is None:
             return False  # both hands must be present
 
+        # Gate 1: neither hand may be a fist
+        if is_fist(left_lm) or is_fist(right_lm):
+            return False
+
         lm_a = left_lm[_LM["THUMB_TIP"]]   # left  thumb tip (ID 4)
         lm_b = right_lm[_LM["THUMB_TIP"]]  # right thumb tip (ID 4)
 
-        # Layer 2: Z-axis anti-spoof gate
+        # Gate 2: Z-axis anti-spoof gate
         if not _z_valid(lm_a, lm_b, self.z_max_diff):
             return False
 
-        # Normalise against the *average* of both hand bounding boxes so
-        # that the threshold does not depend on inter-hand separation.
+        # Gate 3: normalise against the *average* of both hand bounding boxes
+        # so the threshold does not depend on inter-hand separation.
         scale = (_bbox_scale(left_lm) + _bbox_scale(right_lm)) / 2.0
         dist  = _euclidean(lm_a, lm_b) / scale
         return dist < self.touch_threshold
@@ -181,7 +279,7 @@ class FingerTouchDetector:
         on all subsequent frames (the verified state is sticky until
         ``reset()`` is called).
 
-        Layer 3 -- consecutive-frame persistence:
+        Layer 5 -- consecutive-frame persistence:
           The touch must be held for ``verify_frames`` unbroken frames.
           Any frame without a valid touch resets the counter to zero.
         """

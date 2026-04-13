@@ -16,6 +16,7 @@ Fixes left-hand detection bias with:
 """
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -193,7 +194,7 @@ class HandTracker:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
         # -- Step 3: Detection (VIDEO mode = static_image_mode=False) -----
-        self._frame_ts += 33
+        self._frame_ts = int(time.time() * 1000)
         result = self._landmarker.detect_for_video(mp_image, self._frame_ts)
 
         # -- Step 4: Assign handedness by wrist screen position -----------

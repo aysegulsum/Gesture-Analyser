@@ -27,6 +27,7 @@ from typing import Optional
 
 from hand_tracker import HandResult
 from finger_touch_detector import FingerTouchDetector, TouchCommand
+from audit_logger import log as _log
 
 
 # ── Command catalogue (fixed order for exhaustive testing) ───────────
@@ -104,6 +105,8 @@ class FingerTouchSession:
                 next_idx = self.current_idx + 1
                 if next_idx >= len(_ALL_TOUCH_COMMANDS):
                     self.state = TouchTestState.COMPLETE
+                    _log("session_complete", mode="Touch Test",
+                         passed=sum(self.passed), total=len(_ALL_TOUCH_COMMANDS))
                 else:
                     self._start_command(next_idx)
             return self.state
@@ -113,6 +116,9 @@ class FingerTouchSession:
             self.passed[self.current_idx] = True
             self.state       = TouchTestState.SUCCESS
             self._success_at = now
+            _log("touch_success", mode="Touch Test",
+                 command=self.command_name,
+                 step=self.current_idx + 1, total=len(_ALL_TOUCH_COMMANDS))
 
         return self.state
 

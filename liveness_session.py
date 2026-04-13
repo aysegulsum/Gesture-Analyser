@@ -35,6 +35,7 @@ from motion_analyzer import WaveDetector, ShapeRecognizer
 from anti_spoof import AntiSpoofAnalyzer, SpoofResult
 from finger_touch_detector import FingerTouchDetector, TouchCommand
 from shape_tracer import ShapeTracerSession, TracerState, DEFAULT_DRAW_TIME
+from audit_logger import log as _log
 
 
 # ── Command definitions ─────────────────────────────────────────────
@@ -227,6 +228,7 @@ class LivenessChallenge:
         """Pick the next challenge from the queue."""
         if self.challenges_completed >= len(self._challenge_queue):
             self.state = LivenessState.VERIFIED_100
+            _log("verified_100", mode="Liveness", score=self.score)
             return
 
         self.current_cmd = self._challenge_queue[self.challenges_completed]
@@ -418,6 +420,9 @@ class LivenessChallenge:
             self.state = LivenessState.FAILED
             self._result_at = now
             self.streak = 0
+            _log("challenge_failed", mode="Liveness",
+                 command=self.current_cmd.name,
+                 challenge_num=self.challenges_completed + 1)
             return self.state
 
         should_process = (self._frame_counter % self.process_every_nth == 0)
@@ -530,6 +535,10 @@ class LivenessChallenge:
         self._result_at = now
         self.score += 1
         self.streak += 1
+        _log("challenge_success", mode="Liveness",
+             command=self.current_cmd.name,
+             challenge_num=self.challenges_completed + 1,
+             score=self.score, streak=self.streak)
 
     # -- Display helpers --------------------------------------------------
 

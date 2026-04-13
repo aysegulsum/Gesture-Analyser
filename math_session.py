@@ -34,6 +34,7 @@ from typing import Optional
 
 from hand_tracker import HandResult
 from gesture_validator import GestureValidator
+from audit_logger import log as _log
 
 
 # ── Controlled question generator ───────────────────────────────────
@@ -147,6 +148,7 @@ class MathSession:
         self._success_at  = None
         self._last_total  = None
         self._validator.clear_buffers()
+        _log("round_start", mode="Math", equation=self._equation, answer=self._answer)
 
     # -- Public API -------------------------------------------------------
 
@@ -161,6 +163,7 @@ class MathSession:
         # Check 60-second timeout.
         if self.time_remaining <= 0 and self.state != MathState.GAME_OVER:
             self.state = MathState.GAME_OVER
+            _log("game_over", mode="Math", score=self.score)
             return self.state
 
         if self.state == MathState.GAME_OVER:
@@ -191,6 +194,8 @@ class MathSession:
                 self.state = MathState.SUCCESS
                 self._success_at = now
                 self.score += 1
+                _log("success", mode="Math", equation=self._equation,
+                     answer=self._answer, score=self.score)
                 # Optional beep (works on Windows; silent fail elsewhere).
                 try:
                     import winsound

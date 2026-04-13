@@ -32,6 +32,7 @@ from gesture_validator import (
     hand_scale, _euclidean, _LM,
 )
 from motion_analyzer import WaveDetector, ShapeRecognizer
+from audit_logger import log as _log
 
 
 class SeqState(Enum):
@@ -266,6 +267,9 @@ class SequentialSession:
             self.step_results[self.current_step_idx] = StepResult.TIMED_OUT
             self.state = SeqState.STEP_TIMEOUT
             self._step_done_at = now
+            _log("step_timed_out", mode="Sequential",
+                 step=step.name, step_idx=self.current_step_idx + 1,
+                 total=len(_STEPS))
             return self.state
 
         # Check match.
@@ -277,6 +281,9 @@ class SequentialSession:
                 self.step_results[self.current_step_idx] = StepResult.PASSED
                 self.state = SeqState.STEP_DONE
                 self._step_done_at = now
+                _log("step_passed", mode="Sequential",
+                     step=step.name, step_idx=self.current_step_idx + 1,
+                     total=len(_STEPS))
             else:
                 # Hold-based confirmation.
                 if self._hold_start is None:
@@ -286,6 +293,9 @@ class SequentialSession:
                     self.step_results[self.current_step_idx] = StepResult.PASSED
                     self.state = SeqState.STEP_DONE
                     self._step_done_at = now
+                    _log("step_passed", mode="Sequential",
+                         step=step.name, step_idx=self.current_step_idx + 1,
+                         total=len(_STEPS))
         else:
             if step.step_type not in ("wave", "draw_circle", "draw_square", "hand_flip", "peek_a_boo"):
                 self._hold_start = None
@@ -398,6 +408,8 @@ class SequentialSession:
 
         if self.current_step_idx >= len(_STEPS):
             self.state = SeqState.COMPLETE
+            _log("session_complete", mode="Sequential",
+                 passed=self.passed_count, total=len(_STEPS))
         else:
             self.state = SeqState.ACTIVE
 

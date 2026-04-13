@@ -23,6 +23,7 @@ from typing import Optional
 
 from hand_tracker import HandResult
 from gesture_validator import GestureValidator
+from audit_logger import log as _log
 
 
 class SessionState(Enum):
@@ -96,6 +97,7 @@ class GestureSession:
                 self.state = SessionState.VALIDATED
                 self._validated_at = now
                 self.score += 1
+                _log("success", mode="Normal", target=self.current_target, score=self.score)
         else:
             self._match_start = None
 
@@ -142,3 +144,4 @@ class GestureSession:
         self._validated_at = None
         self._last_total = None
         self._validator.clear_buffers()
+        _log("round_start", mode="Normal", target=self.current_target)

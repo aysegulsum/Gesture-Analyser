@@ -38,6 +38,7 @@ from sequential_session import SequentialSession, SeqState, StepResult
 from finger_touch_session import FingerTouchSession, TouchTestState
 from tracing_evaluator import TracingEvaluator
 from shape_trace_eval_session import ShapeTraceEvalSession, EvalMode, _EvalState
+from audit_logger import log as _log, SESSION_ID
 
 
 # -- colour palette -------------------------------------------------------
@@ -1063,6 +1064,8 @@ def run():
     gm = GameManager()
 
     print("Gesture Validator -- 'M' cycle modes, 'R' restart, 'Q' quit.")
+    print(f"Audit log: logs/audit_{SESSION_ID}.jsonl")
+    _log("app_start", mode=gm.mode_name)
 
     # FPS counter state
     _fps_prev_time = time.time()
@@ -1112,13 +1115,16 @@ def run():
             elif key == ord("m"):
                 gm.cycle_mode()
                 print(f"Mode: {gm.mode_name}")
+                _log("mode_change", mode=gm.mode_name)
             elif key == ord("r"):
                 gm.restart()
                 print(f"{gm.mode_name} restarted!")
+                _log("session_restart", mode=gm.mode_name)
             elif key == ord("e") and gm.current_mode == 6:
                 gm.shape_eval.cycle_mode()
                 print(f"Eval mode: {gm.shape_eval.eval_mode.label}")
 
+    _log("app_quit", mode=gm.mode_name)
     cap.release()
     cv2.destroyAllWindows()
 

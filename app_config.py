@@ -147,6 +147,13 @@ class ShapeEvalConfig:
 
 
 @dataclass
+class LoggingConfig:
+    """Session audit logger settings."""
+    enabled: bool = True
+    log_dir: str  = "logs"
+
+
+@dataclass
 class AppConfig:
     """Root configuration object.
 
@@ -166,6 +173,7 @@ class AppConfig:
     touch_test:  TouchTestConfig  = field(default_factory=TouchTestConfig)
     shape_trace: ShapeTraceConfig = field(default_factory=ShapeTraceConfig)
     shape_eval:  ShapeEvalConfig  = field(default_factory=ShapeEvalConfig)
+    logging:     LoggingConfig    = field(default_factory=LoggingConfig)
 
 
 # ── YAML loader ───────────────────────────────────────────────────────────────
@@ -272,6 +280,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         "touch_test":  config.touch_test,
         "shape_trace": config.shape_trace,
         "shape_eval":  config.shape_eval,
+        "logging":     config.logging,
     }
 
     for section_name, section_obj in section_map.items():

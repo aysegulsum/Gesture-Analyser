@@ -139,3 +139,14 @@ shape_trace:
 shape_eval:
   dtw_threshold: 0.25   # acceptance threshold forwarded to ShapeTracerSession
   auto_advance:  true   # auto-advance to next round after result_pause expires
+
+
+# ── Session Audit Logger ──────────────────────────────────────────────────────
+#
+#  One JSON-Lines record is appended to <log_dir>/sessions.jsonl each time a
+#  mode reaches a terminal state (game-over, verified, complete).
+#  Set enabled: false to silence all logging without touching source code.
+#
+logging:
+  enabled: true
+  log_dir: "logs"   # relative to the working directory; created automatically

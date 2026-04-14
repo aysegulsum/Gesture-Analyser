@@ -262,6 +262,10 @@ class LivenessChallenge:
                 time_limit=DEFAULT_DRAW_TIME,
                 dtw_threshold=0.25,
             )
+            # Flush the anti-spoof buffer so data from the previous
+            # challenge (which may have involved a lot of motion) does
+            # not bleed into the next non-tracing challenge.
+            self._anti_spoof.reset()
         else:
             self._shape_tracer = None
 
@@ -379,8 +383,19 @@ class LivenessChallenge:
         now = time.time()
         self._frame_counter += 1
 
-        # Anti-spoof: feed data every frame.
-        if hands:
+        # Anti-spoof: feed data every frame, EXCEPT during Shape Tracing.
+        #
+        # Shape Tracing requires the user to hold their finger perfectly still
+        # on the Start Point for 0.5 s (POSITIONING phase) before recording
+        # begins.  That deliberate stillness is indistinguishable from a
+        # spoofed static image to the MicroTremorDetector, so feeding
+        # anti-spoof data during this challenge produces guaranteed false
+        # positives.  We skip the feed entirely for SHAPE_TRACE challenges
+        # and reset the anti-spoof state so the next non-tracing challenge
+        # starts with a clean buffer.
+        _is_shape_trace = (self.current_cmd is not None and
+                           self.current_cmd.cmd_type == CmdType.SHAPE_TRACE)
+        if hands and not _is_shape_trace:
             wrist = hands[0].landmarks[0]
             # Use hand_scale as brightness proxy -- changes naturally with
             # hand movement/distance but stays constant for a static image.

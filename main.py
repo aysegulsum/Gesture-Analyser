@@ -24,11 +24,17 @@ hud_renderer  -- all OpenCV drawing utilities and per-mode HUD functions.
 main loop     -- capture + render only; no game logic here.
 """
 
+import logging
 import time
 
 import cv2
 
 from app_config import cfg
+
+_log = logging.getLogger(__name__)
+
+# Maximum consecutive frame errors before the loop exits cleanly.
+_MAX_CONSECUTIVE_ERRORS = 10
 from hand_tracker import HandTracker, draw_landmarks
 from game_manager import GameManager
 from hud_renderer import (
@@ -57,11 +63,13 @@ def run():
 
     _fps_prev_time = time.time()
     _fps_value = 0.0
+    _consecutive_errors = 0
 
     with tracker:
         while True:
             ok, frame = cap.read()
             if not ok:
+                _log.warning("cap.read() returned False — camera disconnected?")
                 break
 
             frame = cv2.flip(frame, 1)
@@ -73,28 +81,56 @@ def run():
                 _fps_value = 0.7 * (1.0 / dt) + 0.3 * _fps_value
             _fps_prev_time = _now
 
-            # Detection (separated from game logic)
-            hands = tracker.process(frame)
+            try:
+                # Detection (separated from game logic)
+                hands = tracker.process(frame)
 
-            # Draw landmarks
-            for hand in hands:
-                draw_landmarks(frame, hand)
+                # Draw landmarks
+                for hand in hands:
+                    draw_landmarks(frame, hand)
 
-            # Game logic (delegated to GameManager)
-            gm.update(hands)
+                # Game logic (delegated to GameManager)
+                gm.update(hands)
 
-            # HUD rendering
-            if not gm.hands_present:
-                draw_no_hand_overlay(frame)
-            HUD_DRAWERS[gm.current_mode](frame, gm, hands)
+                # HUD rendering
+                if not gm.hands_present:
+                    draw_no_hand_overlay(frame)
+                HUD_DRAWERS[gm.current_mode](frame, gm, hands)
 
-            # Mode indicator (bottom-right) + FPS counter (bottom-left)
-            fh, fw = frame.shape[:2]
-            put_text_with_bg(frame, f"[M] {gm.mode_name}", (fw - 220, fh - 20),
-                             font_scale=0.55, color=CYAN)
-            fps_color = GREEN if _fps_value >= 25 else YELLOW if _fps_value >= 15 else RED
-            put_text_with_bg(frame, f"FPS: {_fps_value:.0f}", (10, fh - 20),
-                             font_scale=0.5, color=fps_color)
+                # Mode indicator (bottom-right) + FPS counter (bottom-left)
+                fh, fw = frame.shape[:2]
+                put_text_with_bg(frame, f"[M] {gm.mode_name}", (fw - 220, fh - 20),
+                                 font_scale=0.55, color=CYAN)
+                fps_color = GREEN if _fps_value >= 25 else YELLOW if _fps_value >= 15 else RED
+                put_text_with_bg(frame, f"FPS: {_fps_value:.0f}", (10, fh - 20),
+                                 font_scale=0.5, color=fps_color)
+
+                _consecutive_errors = 0  # reset on successful frame
+
+            except Exception as exc:  # noqa: BLE001
+                _consecutive_errors += 1
+                _log.error(
+                    "Frame error #%d/%d: %s",
+                    _consecutive_errors, _MAX_CONSECUTIVE_ERRORS, exc,
+                    exc_info=True,
+                )
+                if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    _log.critical(
+                        "Reached %d consecutive errors — shutting down.",
+                        _MAX_CONSECUTIVE_ERRORS,
+                    )
+                    break
+                # Show a brief error banner so the user knows something is wrong.
+                try:
+                    fh, fw = frame.shape[:2]
+                    put_text_with_bg(
+                        frame,
+                        f"ERROR ({_consecutive_errors}/{_MAX_CONSECUTIVE_ERRORS}) — see logs",
+                        (10, fh // 2),
+                        font_scale=0.6, color=RED,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass  # if even drawing fails, just continue
 
             cv2.imshow("Gesture Validator", frame)
 

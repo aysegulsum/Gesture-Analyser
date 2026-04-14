@@ -16,6 +16,7 @@ Fixes left-hand detection bias with:
 """
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -176,7 +177,6 @@ class HandTracker:
             min_tracking_confidence=min_tracking_confidence,
         )
         self._landmarker = HandLandmarker.create_from_options(options)
-        self._frame_ts = 0
 
         # Persistent slots for each hand.
         self._left = _HandSlot("Left", max_lost_frames)
@@ -200,8 +200,11 @@ class HandTracker:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
         # -- Step 3: Detection (VIDEO mode = static_image_mode=False) -----
-        self._frame_ts += 33
-        result = self._landmarker.detect_for_video(mp_image, self._frame_ts)
+        # Use the real wall-clock millisecond timestamp so MediaPipe's VIDEO
+        # mode receives accurate inter-frame deltas regardless of the actual
+        # camera frame rate.  The previous `+= 33` hardcoded 30 fps and drifted
+        # immediately on 60 fps cameras, degrading optical-flow quality.
+        result = self._landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
         # -- Step 4: Assign handedness by wrist screen position -----------
         # We completely ignore MediaPipe's handedness classification.

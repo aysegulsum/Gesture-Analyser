@@ -8,10 +8,22 @@ Selects 5 challenges from the pool (all 4 types guaranteed, 1 random repeat):
 
   MATH     — solve a simple arithmetic question with fingers (0-10 result)
   GESTURE  — show a specific number / configuration of fingers
-  TOUCH    — pinch specific fingertips (Z-validated, 10-frame hold)
+             Uses snapshot verification: 4-second countdown, verdict at T=0
+             based on whether the pose was held across the last 5 frames.
+  TOUCH    — pinch specific fingertips (Z-validated)
+             Uses snapshot verification: same countdown model as GESTURE.
   TRACE    — follow a visual shape template (DTW-verified, point-to-point)
              TRACE gets 1 automatic retry if the first attempt fails.
              Final quality = mean(attempt_qualities).
+
+Snapshot verification (GESTURE / TOUCH)
+----------------------------------------
+  A prominent countdown ring counts down SNAPSHOT_COUNTDOWN (4 s).
+  During the countdown the system samples the pose every frame and
+  stores the last SNAPSHOT_BUFFER (5) boolean detections.
+  At T = 0 the verdict is: pass if ≥ SNAPSHOT_PASS_RATIO (60 %) of
+  those buffered frames detected the required pose, fail otherwise.
+  TRACE is exempt — it uses the existing real-time DTW pipeline.
 
 State machine
 -------------
@@ -73,9 +85,11 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
 
+from collections import deque
+
 from hand_tracker import HandResult
 from liveness_session import (
-    LivenessChallenge, LivenessState,
+    LivenessChallenge, LivenessState, CmdType,
     _GESTURE_CMDS, _TOUCH_CMDS, _SHAPE_CMDS,
 )
 from math_session import MathSession, MathState
@@ -91,6 +105,11 @@ MATH_TIME_LIMIT     = 30.0  # seconds per math challenge
 RESULT_DISPLAY_TIME = 1.2   # seconds to show pass/fail screen before advancing
 TRACE_MAX_ATTEMPTS  = 2     # 1 retry allowed on TRACE failure
 TRACE_RETRY_DISPLAY = 2.0   # seconds for the "Retrying..." screen between attempts
+
+# Snapshot verification (GESTURE / TOUCH challenges only)
+SNAPSHOT_COUNTDOWN  = 4.0   # seconds shown on countdown before evaluating pose
+SNAPSHOT_BUFFER     = 5     # last N frames of detection results averaged at T=0
+SNAPSHOT_PASS_RATIO = 0.6   # ≥ 60 % of buffered frames must show the pose to pass
 
 
 # ── Public types ─────────────────────────────────────────────────────
@@ -264,6 +283,165 @@ class _LivenessAdapter:
         return 1.0
 
 
+class _SnapshotLivenessAdapter:
+    """
+    Gesture / Touch adapter with countdown-based snapshot verification.
+
+    Instead of the continuous frame-by-frame hold that _LivenessAdapter uses,
+    this adapter shows a SNAPSHOT_COUNTDOWN timer to the user.  At T = 0 the
+    system evaluates the pose that was held over the last SNAPSHOT_BUFFER
+    frames.  If at least SNAPSHOT_PASS_RATIO of those frames detected the
+    required gesture/touch, the challenge passes.
+
+    This feels more natural than a silent debounce window: the user sees a
+    ticking ring, holds the pose, and the verdict is delivered all at once
+    when the ring completes.
+
+    Evaluation pipeline (every frame during countdown)
+    --------------------------------------------------
+    GESTURE  → LivenessChallenge._gesture_matched(hands)
+               Uses the smoothed GestureValidator to count fingers.
+    TOUCH    → FingerTouchDetector._is_touching_this_frame(hands)
+               Raw single-frame Z-validated pinch check (no hold counter).
+
+    Both results are appended to a rolling deque(maxlen=SNAPSHOT_BUFFER).
+    At T = 0 the ratio pass/total is compared to SNAPSHOT_PASS_RATIO.
+
+    Post-evaluation the result is held for RESULT_DISPLAY_TIME before the
+    adapter returns True / False to the orchestrator.
+
+    TRACE is explicitly exempt and continues to use _TraceWithRetryAdapter.
+    """
+
+    def __init__(self, pool: list, challenge_type: ChallengeType) -> None:
+        chosen_cmd = random.choice(pool)
+
+        # LivenessChallenge is used for:
+        #   • command label / display helpers
+        #   • _gesture_matched()  (uses the smoothed GestureValidator)
+        #   • _touch_detector     (per-frame Z-validated check)
+        # Its own time-limit is set very high so it never auto-fires during
+        # our countdown; we bypass its state machine entirely for verdicts.
+        self._lv = LivenessChallenge(
+            time_limit=SNAPSHOT_COUNTDOWN + 60.0,
+            debounce_seconds=0.5,
+            area_change_threshold=0.20,
+            pause_after_result=RESULT_DISPLAY_TIME,
+            smoothing_window=7,
+            num_challenges=1,
+        )
+        self._lv._challenge_queue     = [chosen_cmd]
+        self._lv.challenges_completed = 0
+        self._lv._pick_next()
+
+        self._challenge_type = challenge_type
+        self._start          = time.time()
+
+        # Rolling per-frame detection buffer.
+        self._buffer: deque[bool] = deque(maxlen=SNAPSHOT_BUFFER)
+
+        # Live feedback for the HUD.
+        self._detected_this_frame: bool = False
+
+        # Post-snapshot verdict.
+        self._snapshot_taken:  bool          = False
+        self._snapshot_result: Optional[bool] = None
+        self._result_at:       Optional[float] = None
+
+        self.quality:  float = 0.0
+        self.attempts: int   = 1
+
+    # -- Per-frame detection (no state-machine side-effects) --------------
+
+    def _detect_this_frame(self, hands: list) -> bool:
+        """Single-frame pose check — does NOT advance any hold counter."""
+        if not hands:
+            return False
+        ct = self._lv.current_cmd.cmd_type
+        if ct == CmdType.GESTURE:
+            return self._lv._gesture_matched(hands)
+        if ct == CmdType.FINGER_TOUCH:
+            td = self._lv._touch_detector
+            return td._is_touching_this_frame(hands) if td is not None else False
+        return False
+
+    # -- Adapter public API -----------------------------------------------
+
+    def update(self, hands: list) -> Optional[bool]:
+        now     = time.time()
+        elapsed = now - self._start
+
+        # --- Holding the result display after the snapshot ---
+        if self._snapshot_result is not None:
+            if now - self._result_at >= RESULT_DISPLAY_TIME:
+                return self._snapshot_result
+            return None
+
+        # --- Countdown still running — sample every frame ---
+        self._detected_this_frame = self._detect_this_frame(hands)
+        self._buffer.append(self._detected_this_frame)
+
+        # --- T = 0 reached: evaluate the buffer ---
+        if elapsed >= SNAPSHOT_COUNTDOWN and not self._snapshot_taken:
+            self._snapshot_taken  = True
+            ratio  = sum(self._buffer) / len(self._buffer) if self._buffer else 0.0
+            passed = ratio >= SNAPSHOT_PASS_RATIO
+            self._snapshot_result = passed
+            self._result_at       = now
+            self.quality          = 1.0 if passed else 0.0
+
+        return None
+
+    # -- Display helpers --------------------------------------------------
+
+    @property
+    def inner(self) -> LivenessChallenge:
+        """Exposes LivenessChallenge for command label and per-hand info."""
+        return self._lv
+
+    @property
+    def label(self) -> str:
+        return self._lv.current_cmd.name if self._lv.current_cmd else ""
+
+    @property
+    def challenge_type(self) -> ChallengeType:
+        return self._challenge_type
+
+    @property
+    def snapshot_remaining(self) -> float:
+        """Seconds left on the countdown (clamped to 0 once expired)."""
+        if self._snapshot_taken:
+            return 0.0
+        return max(0.0, SNAPSHOT_COUNTDOWN - (time.time() - self._start))
+
+    @property
+    def snapshot_progress(self) -> float:
+        """Fraction of the countdown elapsed (0.0 → 1.0)."""
+        return min((time.time() - self._start) / SNAPSHOT_COUNTDOWN, 1.0)
+
+    @property
+    def detected_this_frame(self) -> bool:
+        """True when the current frame shows the required pose."""
+        return self._detected_this_frame
+
+    @property
+    def buffer_ratio(self) -> float:
+        """Fraction of the rolling buffer frames that detected the pose."""
+        if not self._buffer:
+            return 0.0
+        return sum(self._buffer) / len(self._buffer)
+
+    @property
+    def snapshot_taken(self) -> bool:
+        """True once T = 0 has been reached and the verdict is decided."""
+        return self._snapshot_taken
+
+    @property
+    def snapshot_result(self) -> Optional[bool]:
+        """None until the snapshot is taken; True/False afterwards."""
+        return self._snapshot_result
+
+
 class _TraceWithRetryAdapter:
     """
     Wraps up to TRACE_MAX_ATTEMPTS _LivenessAdapter(TRACE) instances.
@@ -433,9 +611,11 @@ class ActiveLivenessSession:
         if ct == ChallengeType.MATH:
             return _MathAdapter()
         if ct == ChallengeType.GESTURE:
-            return _LivenessAdapter(_GESTURE_CMDS, ChallengeType.GESTURE)
+            # Snapshot mode: 4-second countdown → single verdict at T=0
+            return _SnapshotLivenessAdapter(_GESTURE_CMDS, ChallengeType.GESTURE)
         if ct == ChallengeType.TOUCH:
-            return _LivenessAdapter(_TOUCH_CMDS, ChallengeType.TOUCH)
+            # Snapshot mode: 4-second countdown → single verdict at T=0
+            return _SnapshotLivenessAdapter(_TOUCH_CMDS, ChallengeType.TOUCH)
         if ct == ChallengeType.TRACE:
             return _TraceWithRetryAdapter()
         raise ValueError(f"Unknown ChallengeType: {ct}")

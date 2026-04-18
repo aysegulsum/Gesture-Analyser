@@ -43,7 +43,10 @@ from active_liveness_manager import (
     TRANSITION_DURATION as _ALM_TRANSITION_DURATION,
     TRACE_RETRY_DISPLAY as _ALM_RETRY_DURATION,
     TRACE_MAX_ATTEMPTS,
-    _MathAdapter, _LivenessAdapter, _TraceWithRetryAdapter,
+    SNAPSHOT_COUNTDOWN as _ALM_SNAPSHOT_COUNTDOWN,
+    SNAPSHOT_BUFFER    as _ALM_SNAPSHOT_BUFFER,
+    _MathAdapter, _SnapshotLivenessAdapter,
+    _TraceWithRetryAdapter,
 )
 
 
@@ -1200,56 +1203,80 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
                                  (w - 180, y_off), font_scale=0.6)
                 y_off += 28
 
-    # ── GESTURE / TOUCH sub-HUD (delegates to liveness internals) ────
-    elif ct in (ChallengeType.GESTURE, ChallengeType.TOUCH) and isinstance(cur, _LivenessAdapter):
-        lv = cur.inner
-        ls = lv.state
+    # ── GESTURE / TOUCH sub-HUD (snapshot countdown verification) ────
+    elif ct in (ChallengeType.GESTURE, ChallengeType.TOUCH) and isinstance(cur, _SnapshotLivenessAdapter):
+        snap_rem  = cur.snapshot_remaining
+        snap_prog = cur.snapshot_progress
+        detected  = cur.detected_this_frame
+        buf_ratio = cur.buffer_ratio
+        result    = cur.snapshot_result   # None / True / False
 
-        if lv.is_flash_red:
+        # ── After verdict: show PASS / FAILED splash ──────────────────
+        if result is not None:
+            splash_col = GREEN if result else RED
+            splash_txt = "PASS!" if result else "FAILED!"
+
             overlay = frame.copy()
-            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 200), -1)
-            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+            cv2.rectangle(overlay, (0, 0), (w, h),
+                          (0, 100, 0) if result else (0, 0, 120), -1)
+            cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
 
-        # Countdown ring (top-right).
-        draw_countdown_ring(frame, lv.time_remaining, lv._effective_time_limit,
-                            w - 90, 90, radius=55)
+            put_text_centered(frame, splash_txt, h // 2 - 25,
+                              font_scale=1.8, color=splash_col, thickness=4)
+            put_text_centered(frame, cur.label, h // 2 + 30,
+                              font_scale=0.75, color=WHITE)
+            # Buffer consistency indicator.
+            b_col = GREEN if buf_ratio >= 0.8 else YELLOW if buf_ratio >= 0.5 else RED
+            put_text_centered(frame,
+                              f"Pose consistency: {int(buf_ratio * _ALM_SNAPSHOT_BUFFER)}"
+                              f"/{_ALM_SNAPSHOT_BUFFER} frames",
+                              h // 2 + 62, font_scale=0.55, color=b_col)
+            return
 
-        if ls == LivenessState.SUCCESS:
-            put_text_centered(frame, "DONE!", h // 2 - 20,
-                              font_scale=1.4, color=GREEN, thickness=3)
-        elif ls == LivenessState.FAILED:
-            put_text_centered(frame, "FAILED!", h // 2 - 20,
-                              font_scale=1.4, color=RED, thickness=3)
+        # ── T = 0 reached but result_at not yet set (shouldn't linger,
+        #    but show "EVALUATING..." as a safe fallback) ─────────────
+        if cur.snapshot_taken:
+            put_text_centered(frame, cur.label, h // 2 - 50,
+                              font_scale=1.0, color=WHITE, thickness=2)
+            put_text_centered(frame, "EVALUATING...",
+                              h // 2 + 10, font_scale=1.1, color=CYAN, thickness=2)
+            return
+
+        # ── Countdown still running ───────────────────────────────────
+
+        # Command label (centre, large).
+        cmd_col = GREEN if detected else WHITE
+        put_text_centered(frame, cur.label, h // 2 - 55,
+                          font_scale=1.0, color=cmd_col, thickness=2)
+
+        # Prominent countdown ring (top-right, larger than normal).
+        draw_countdown_ring(frame, snap_rem, _ALM_SNAPSHOT_COUNTDOWN,
+                            w - 95, 95, radius=65)
+
+        # "Pose detected" live badge (centre).
+        if detected:
+            put_text_centered(frame, "Pose detected ✓",
+                              h // 2 - 10, font_scale=0.85, color=GREEN, thickness=2)
         else:
-            cmd_col = ORANGE if ls == LivenessState.DEBOUNCE else WHITE
-            put_text_centered(frame, lv.command_label, h // 2 - 20,
-                              font_scale=1.0, color=cmd_col, thickness=2)
-            if ls == LivenessState.DEBOUNCE:
-                draw_progress_bar(frame, lv.debounce_progress,
-                                  y=h // 2 + 10, color_full=GREEN, color_fill=ORANGE)
-                put_text_centered(frame, "Confirming...", h // 2 + 50,
-                                  font_scale=0.7, color=ORANGE)
+            put_text_centered(frame, "Hold the pose...",
+                              h // 2 - 10, font_scale=0.75, color=YELLOW)
 
-            # TOUCH: hold counter + progress bar.
-            if lv.is_touch_cmd:
-                frames = lv.touch_frame_count
-                f_col  = GREEN if frames >= 8 else YELLOW if frames >= 4 else WHITE
-                put_text_with_bg(frame, f"Hold: {frames}/10 frames",
-                                 (20, h - 125), font_scale=0.65, color=f_col)
-                draw_progress_bar(frame, lv.touch_frame_progress, y=h - 108,
-                                  color_full=GREEN, color_fill=YELLOW)
+        # Buffer consistency bar (shows how steady the pose has been).
+        draw_progress_bar(frame, buf_ratio, y=h // 2 + 20,
+                          color_full=GREEN, color_fill=YELLOW)
+        b_txt = f"Consistency: {int(buf_ratio * _ALM_SNAPSHOT_BUFFER)}/{_ALM_SNAPSHOT_BUFFER} frames"
+        b_col = GREEN if buf_ratio >= 0.8 else YELLOW if buf_ratio >= 0.4 else WHITE
+        put_text_centered(frame, b_txt, h // 2 + 50,
+                          font_scale=0.55, color=b_col)
 
-        status_col = GREEN if ls == LivenessState.SUCCESS else RED if ls == LivenessState.FAILED else YELLOW
-        put_text_with_bg(frame, lv.status_label, (20, h - 90),
-                         font_scale=0.7, color=status_col)
+        # Snapshot countdown text (bottom-left).
+        t_col = RED if snap_rem < 1.0 else YELLOW if snap_rem < 2.0 else WHITE
+        put_text_with_bg(frame, f"Snapshot in {snap_rem:.1f}s",
+                         (20, h - 90), font_scale=0.7, color=t_col, thickness=2)
 
-        per_hand = lv.per_hand_counts(hands)
-        y_off = h - 55
-        for side in ("Left", "Right"):
-            if side in per_hand:
-                put_text_with_bg(frame, f"{side}: {per_hand[side]}",
-                                 (w - 180, y_off), font_scale=0.6)
-                y_off += 28
+        # Instruction hint (bottom of frame).
+        put_text_centered(frame, "Hold your pose — snapshot taken at 0:00",
+                          h - 55, font_scale=0.55, color=WHITE)
 
     # ── TRACE sub-HUD (with retry support) ───────────────────────────
     elif ct == ChallengeType.TRACE and isinstance(cur, _TraceWithRetryAdapter):

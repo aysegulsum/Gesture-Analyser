@@ -323,10 +323,19 @@ class TracerState(Enum):
 
 
 # Defaults used by ShapeTracerSession and by liveness_session integration
-DEFAULT_DRAW_TIME    = 10.0  # seconds per trace attempt (timer starts at TRACING)
+#
+# DEFAULT_DRAW_TIME raised 10 → 12 s: gives users a comfortable margin
+# especially after the 3 s instruction + 0.5 s position-hold preamble.
+# The timer only starts once TRACING begins, so no time is "wasted".
+#
+# DEFAULT_MIN_HS lowered 0.10 → 0.05: the original value rejected hands
+# that were slightly further from the camera than expected (Z-axis
+# flexibility).  0.05 still blocks hands that are far out of frame while
+# accommodating a much wider range of natural user distances.
+DEFAULT_DRAW_TIME    = 12.0  # seconds per trace attempt (timer starts at TRACING)
 DEFAULT_DTW_THRESH   = 0.25  # normalised per-point DTW cost threshold
 DEFAULT_RESAMPLE_N   = 50    # number of points for DTW comparison
-DEFAULT_MIN_HS       = 0.10  # minimum hand_scale for depth liveness gate
+DEFAULT_MIN_HS       = 0.05  # minimum hand_scale — loosened for Z-axis flexibility
 DEFAULT_POS_HOLD     = 0.50  # seconds to hold at start point before TRACING
 DEFAULT_INSTRUCT_TIME = 3.0  # seconds to show instruction overlay
 
@@ -509,6 +518,7 @@ class ShapeTracerSession:
                 self._start_armed = (sp != ep)   # True for open shapes
                 self.state = TracerState.TRACING
                 self._push_point(fx, fy)
+                print("Tracing Started, Jitter Check: Disabled")
 
         # ── TRACING ───────────────────────────────────────────────────
         elif self.state == TracerState.TRACING:

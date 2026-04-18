@@ -1,24 +1,32 @@
 """
-Fast-Response Liveness Challenge -- v4: Production-Grade
-=========================================================
-Command Types (expanded)
-------------------------
+Fast-Response Liveness Challenge -- v5: Unified Shape Tracing
+=============================================================
+Command Types
+-------------
 1. GESTURE:       Finger-count match
 2. MOVE_CLOSER:   Depth proxy increase >= 20%
 3. MOVE_AWAY:     Depth proxy decrease >= 20%
 4. WAVE:          Oscillation filter with frequency check
-5. DRAW_CIRCLE:   Air-draw circle
-6. DRAW_SQUARE:   Air-draw square
-7. FINGER_TAP:    Touch specific fingers together
-8. HAND_FLIP:     Show palm then back of hand (3D volume change)
-9. PEEK_A_BOO:    Cover face with hands then reveal
+5. FINGER_TAP:    Touch specific fingers together (simple)
+6. HAND_FLIP:     Show palm then back of hand (3D volume change)
+7. PEEK_A_BOO:    Cover face with hands then reveal
+8. FINGER_TOUCH:  Z-validated fingertip pinch with 10-frame hold
+9. SHAPE_TRACE:   Dynamic shape tracing with DTW verification
+                  (the ONLY drawing challenge — always shows a
+                  visual template with Start/End points)
+
+Legacy commands DRAW_CIRCLE and DRAW_SQUARE have been removed.
+All drawing challenges now go through the ShapeTracerSession
+module which renders a visual template on screen before the user
+is asked to trace anything.
 
 Verification Score: 0-100%.  Each successful challenge adds points.
 Access granted only at 100%.  The system picks 5 random challenges
 from the library; each is worth 20%.
 
-Anti-spoofing: integrated micro-tremor + brightness checks run in
-background every frame.
+Anti-spoofing: micro-tremor + brightness checks run every frame
+EXCEPT during SHAPE_TRACE challenges, where deliberate stillness
+at the Start Point would otherwise cause false positives.
 """
 
 import math
@@ -31,7 +39,7 @@ from typing import Optional
 
 from hand_tracker import HandResult
 from gesture_validator import GestureValidator, depth_proxy, is_finger_open, Finger, hand_scale, _euclidean, _LM
-from motion_analyzer import WaveDetector, ShapeRecognizer
+from motion_analyzer import WaveDetector
 from anti_spoof import AntiSpoofAnalyzer, SpoofResult
 from finger_touch_detector import FingerTouchDetector, TouchCommand
 from shape_tracer import ShapeTracerSession, TracerState, DEFAULT_DRAW_TIME
@@ -44,13 +52,12 @@ class CmdType(Enum):
     MOVE_CLOSER = auto()
     MOVE_AWAY = auto()
     WAVE = auto()
-    DRAW_CIRCLE = auto()
-    DRAW_SQUARE = auto()
     FINGER_TAP = auto()
     HAND_FLIP = auto()
     PEEK_A_BOO = auto()
     FINGER_TOUCH = auto()  # validated touch with Z-axis check + 10-frame hold
     SHAPE_TRACE  = auto()  # dynamic shape tracing with DTW verification
+                           # (sole drawing challenge — always renders a visual template)
 
 
 @dataclass(frozen=True)
@@ -81,8 +88,6 @@ _SPATIAL_CMDS = [
 
 _MOTION_CMDS = [
     Command("WAVE YOUR HAND!",      CmdType.WAVE),
-    Command("DRAW A CIRCLE!",       CmdType.DRAW_CIRCLE),
-    Command("DRAW A SQUARE!",       CmdType.DRAW_SQUARE),
 ]
 
 _ADVANCED_CMDS = [
@@ -135,9 +140,6 @@ class LivenessState(Enum):
     VERIFIED_100 = auto()  # all challenges completed
 
 
-_INDEX_TIP = 8
-
-
 @dataclass
 class LivenessChallenge:
     """Production-grade liveness detector with verification score.
@@ -187,11 +189,9 @@ class LivenessChallenge:
 
     _validator: GestureValidator = field(init=False)
     _wave: WaveDetector = field(init=False)
-    _shape: ShapeRecognizer = field(init=False)
     _anti_spoof: AntiSpoofAnalyzer = field(init=False)
 
     _frame_counter: int = field(init=False, default=0)
-    _was_drawing: bool = field(init=False, default=False)
 
     # Hand flip state
     _flip_phase: int = field(init=False, default=0)  # 0=waiting palm, 1=saw palm, waiting back
@@ -211,7 +211,6 @@ class LivenessChallenge:
         self._validator = GestureValidator(smoothing_window=self.smoothing_window)
         self._wave = WaveDetector(buffer_size=40, min_swing=0.10,
                                   min_total_displacement=0.20, min_reversals=2)
-        self._shape = ShapeRecognizer(min_points=15)
         self._anti_spoof = AntiSpoofAnalyzer()
         self._build_queue()
         self._pick_next()
@@ -244,7 +243,6 @@ class LivenessChallenge:
         self.state = LivenessState.ACTIVE
         self._validator.clear_buffers()
         self._wave.reset()
-        self._shape.reset()
 
         # Create a fresh touch detector for FINGER_TOUCH challenges.
         if self.current_cmd.cmd_type == CmdType.FINGER_TOUCH:
@@ -262,14 +260,16 @@ class LivenessChallenge:
                 time_limit=DEFAULT_DRAW_TIME,
                 dtw_threshold=0.25,
             )
+            # Flush the anti-spoof buffer so data from the previous
+            # challenge (which may have involved a lot of motion) does
+            # not bleed into the next non-tracing challenge.
+            self._anti_spoof.reset()
         else:
             self._shape_tracer = None
 
     @property
     def _effective_time_limit(self) -> float:
         ct = self.current_cmd.cmd_type
-        if ct in (CmdType.DRAW_CIRCLE, CmdType.DRAW_SQUARE):
-            return self.time_limit + 3.0
         if ct in (CmdType.WAVE, CmdType.HAND_FLIP, CmdType.PEEK_A_BOO):
             return self.time_limit + 2.0
         if ct == CmdType.FINGER_TOUCH:
@@ -379,8 +379,19 @@ class LivenessChallenge:
         now = time.time()
         self._frame_counter += 1
 
-        # Anti-spoof: feed data every frame.
-        if hands:
+        # Anti-spoof: feed data every frame, EXCEPT during Shape Tracing.
+        #
+        # Shape Tracing requires the user to hold their finger perfectly still
+        # on the Start Point for 0.5 s (POSITIONING phase) before recording
+        # begins.  That deliberate stillness is indistinguishable from a
+        # spoofed static image to the MicroTremorDetector, so feeding
+        # anti-spoof data during this challenge produces guaranteed false
+        # positives.  We skip the feed entirely for SHAPE_TRACE challenges
+        # and reset the anti-spoof state so the next non-tracing challenge
+        # starts with a clean buffer.
+        _is_shape_trace = (self.current_cmd is not None and
+                           self.current_cmd.cmd_type == CmdType.SHAPE_TRACE)
+        if hands and not _is_shape_trace:
             wrist = hands[0].landmarks[0]
             # Use hand_scale as brightness proxy -- changes naturally with
             # hand movement/distance but stays constant for a static image.
@@ -411,10 +422,6 @@ class LivenessChallenge:
 
         # Timeout.
         if now - self._challenge_start >= self._effective_time_limit:
-            if self.current_cmd.cmd_type in (CmdType.DRAW_CIRCLE, CmdType.DRAW_SQUARE):
-                if self._validate_drawing_final():
-                    self._succeed(now)
-                    return self.state
             self.state = LivenessState.FAILED
             self._result_at = now
             self.streak = 0
@@ -450,20 +457,6 @@ class LivenessChallenge:
             if should_process and self._wave.is_waving():
                 self._succeed(now)
                 return self.state
-
-        # Drawing.
-        if ct in (CmdType.DRAW_CIRCLE, CmdType.DRAW_SQUARE):
-            finger_open = self._index_is_open(hands)
-            if finger_open and hands:
-                tip = hands[0].landmarks[_INDEX_TIP]
-                self._shape.push(tip.x, tip.y)
-                self._was_drawing = True
-            elif self._was_drawing and not finger_open and len(self._shape.path) >= self._shape.min_points:
-                if self._validate_drawing_final():
-                    self._succeed(now)
-                    return self.state
-                self._was_drawing = False
-            return self.state
 
         # Finger tap (simple, immediate).
         if ct == CmdType.FINGER_TAP:
@@ -516,13 +509,6 @@ class LivenessChallenge:
             return self._gesture_matched(hands)
         elif ct in (CmdType.MOVE_CLOSER, CmdType.MOVE_AWAY):
             return self._spatial_matched(hands)
-        return False
-
-    def _validate_drawing_final(self) -> bool:
-        if self.current_cmd.cmd_type == CmdType.DRAW_CIRCLE:
-            return self._shape.finalize_circle().matched
-        elif self.current_cmd.cmd_type == CmdType.DRAW_SQUARE:
-            return self._shape.finalize_square().matched
         return False
 
     def _succeed(self, now: float):
@@ -591,18 +577,6 @@ class LivenessChallenge:
         if self.state != LivenessState.FAILED or self._result_at is None:
             return False
         return (time.time() - self._result_at) < 0.6
-
-    @property
-    def drawing_path(self) -> list[tuple[float, float]]:
-        return self._shape.pixel_path
-
-    @property
-    def drawing_point_count(self) -> int:
-        return len(self._shape.path)
-
-    @property
-    def is_drawing_cmd(self) -> bool:
-        return self.current_cmd.cmd_type in (CmdType.DRAW_CIRCLE, CmdType.DRAW_SQUARE)
 
     @property
     def is_wave_cmd(self) -> bool:

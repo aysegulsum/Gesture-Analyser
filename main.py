@@ -554,10 +554,6 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
         cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 200), -1)
         cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
 
-    # Air-drawing canvas (behind all text).
-    if lv.is_drawing_cmd and ls == LivenessState.ACTIVE:
-        _draw_air_canvas(frame, lv.drawing_path, w, h)
-
     # Shape tracing canvas (template guide + live trace, always behind text).
     if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
         st = lv.shape_tracer
@@ -603,8 +599,6 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
         return
 
     if ls == LivenessState.SUCCESS:
-        if lv.is_drawing_cmd:
-            _draw_air_canvas(frame, lv.drawing_path, w, h)
         put_text_centered(frame, "VERIFIED!", h // 2 - 20,
                           font_scale=1.4, color=GREEN, thickness=3)
         if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
@@ -654,14 +648,6 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
                              font_scale=0.65, color=touch_color)
             draw_progress_bar(frame, lv.touch_frame_progress, y=h - 108,
                               color_full=GREEN, color_fill=YELLOW)
-
-        # Drawing hint.
-        if lv.is_drawing_cmd:
-            pts = lv.drawing_point_count
-            hint = (f"Drawing... ({pts} pts) - close fist to finish"
-                    if pts > 0 else "Extend index finger and draw")
-            put_text_with_bg(frame, hint, (20, h - 125),
-                             font_scale=0.55, color=MAGENTA)
 
         # Shape tracing: ALL text goes to the top-left panel — centre stays clear.
         if lv.is_shape_trace_cmd and lv.shape_tracer is not None:

@@ -42,6 +42,7 @@ from active_liveness_manager import (
     ActiveLivenessSession, ALMState, ChallengeType, NUM_CHALLENGES,
     TRANSITION_DURATION as _ALM_TRANSITION_DURATION,
     TRACE_RETRY_DISPLAY as _ALM_RETRY_DURATION,
+    TRACE_MAX_ATTEMPTS,
     _MathAdapter, _LivenessAdapter, _TraceWithRetryAdapter,
 )
 

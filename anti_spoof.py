@@ -27,6 +27,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from app_config import cfg
+
 
 @dataclass
 class SpoofResult:
@@ -55,12 +57,13 @@ class MicroTremorDetector:
         Frames to wait before flagging (avoid false alarm on startup).
     """
 
-    def __init__(self, buffer_size: int = 30, min_std: float = 0.0003,
-                 warmup_frames: int = 90):
-        self.min_std = min_std
-        self.warmup = warmup_frames
-        self._xs: deque[float] = deque(maxlen=buffer_size)
-        self._ys: deque[float] = deque(maxlen=buffer_size)
+    def __init__(self, buffer_size: int | None = None, min_std: float | None = None,
+                 warmup_frames: int | None = None):
+        self.min_std = min_std        if min_std        is not None else cfg.anti_spoof.tremor_min_std
+        self.warmup  = warmup_frames  if warmup_frames  is not None else cfg.anti_spoof.tremor_warmup_frames
+        _buf         = buffer_size    if buffer_size    is not None else cfg.anti_spoof.tremor_buffer_size
+        self._xs: deque[float] = deque(maxlen=_buf)
+        self._ys: deque[float] = deque(maxlen=_buf)
         self._frame_count = 0
 
     def push(self, wrist_x: float, wrist_y: float) -> None:
@@ -103,9 +106,10 @@ class BrightnessMonitor:
         Minimum brightness variance to be considered natural.
     """
 
-    def __init__(self, buffer_size: int = 60, min_variance: float = 0.05):
-        self.min_var = min_variance
-        self._values: deque[float] = deque(maxlen=buffer_size)
+    def __init__(self, buffer_size: int | None = None, min_variance: float | None = None):
+        self.min_var = min_variance if min_variance is not None else cfg.anti_spoof.brightness_min_var
+        _buf         = buffer_size  if buffer_size  is not None else cfg.anti_spoof.brightness_buffer
+        self._values: deque[float] = deque(maxlen=_buf)
 
     def push(self, avg_brightness: float) -> None:
         """Push the average brightness of the hand region."""

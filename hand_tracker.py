@@ -16,12 +16,15 @@ Fixes left-hand detection bias with:
 """
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 import cv2
 import mediapipe as mp
 import numpy as np
+
+from app_config import cfg
 
 _MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
 
@@ -41,7 +44,12 @@ class HandResult:
 
 
 # ── CLAHE contrast enhancer (created once, reused) ──────────────────
-_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+# Parameters sourced from config so operators can tune contrast enhancement
+# for different lighting environments without touching source code.
+_clahe = cv2.createCLAHE(
+    clipLimit=cfg.tracker.clahe_clip_limit,
+    tileGridSize=(cfg.tracker.clahe_tile_size, cfg.tracker.clahe_tile_size),
+)
 
 
 def _enhance_frame(bgr: np.ndarray) -> np.ndarray:
@@ -169,7 +177,6 @@ class HandTracker:
             min_tracking_confidence=min_tracking_confidence,
         )
         self._landmarker = HandLandmarker.create_from_options(options)
-        self._frame_ts = 0
 
         # Persistent slots for each hand.
         self._left = _HandSlot("Left", max_lost_frames)
@@ -193,8 +200,11 @@ class HandTracker:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
         # -- Step 3: Detection (VIDEO mode = static_image_mode=False) -----
-        self._frame_ts += 33
-        result = self._landmarker.detect_for_video(mp_image, self._frame_ts)
+        # Use the real wall-clock millisecond timestamp so MediaPipe's VIDEO
+        # mode receives accurate inter-frame deltas regardless of the actual
+        # camera frame rate.  The previous `+= 33` hardcoded 30 fps and drifted
+        # immediately on 60 fps cameras, degrading optical-flow quality.
+        result = self._landmarker.detect_for_video(mp_image, int(time.time() * 1000))
 
         # -- Step 4: Assign handedness by wrist screen position -----------
         # We completely ignore MediaPipe's handedness classification.

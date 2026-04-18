@@ -43,6 +43,7 @@ from motion_analyzer import WaveDetector
 from anti_spoof import AntiSpoofAnalyzer, SpoofResult
 from finger_touch_detector import FingerTouchDetector, TouchCommand
 from shape_tracer import ShapeTracerSession, TracerState, DEFAULT_DRAW_TIME
+from app_config import cfg
 
 
 # ── Command definitions ─────────────────────────────────────────────
@@ -207,6 +208,14 @@ class LivenessChallenge:
     # Shape tracing state (SHAPE_TRACE commands)
     _shape_tracer: Optional[ShapeTracerSession] = field(init=False, default=None)
 
+    # Anti-spoof hard gate
+    # Counts consecutive frames where the analyzer flags is_suspicious=True.
+    # When this counter reaches cfg.anti_spoof.block_frames the challenge is
+    # immediately failed and _spoof_blocked is set so the HUD can show a
+    # distinct "SPOOF DETECTED" message instead of the generic "FAILED" banner.
+    _spoof_consecutive: int  = field(init=False, default=0)
+    _spoof_blocked:     bool = field(init=False, default=False)
+
     def __post_init__(self):
         self._validator = GestureValidator(smoothing_window=self.smoothing_window)
         self._wave = WaveDetector(buffer_size=40, min_swing=0.10,
@@ -240,6 +249,8 @@ class LivenessChallenge:
         self._peekaboo_phase = 0
         self._peekaboo_hidden_at = None
         self._frame_counter = 0
+        self._spoof_consecutive = 0
+        self._spoof_blocked = False
         self.state = LivenessState.ACTIVE
         self._validator.clear_buffers()
         self._wave.reset()
@@ -409,6 +420,24 @@ class LivenessChallenge:
                 self._pick_next()
             return self.state
 
+        # ── Anti-spoof hard gate ──────────────────────────────────────────
+        # Only active while a challenge is running (ACTIVE or DEBOUNCE).
+        # A single suspicious frame does not trigger a block — the hand may
+        # momentarily freeze.  Sustained suspicion for block_frames consecutive
+        # frames is treated as a definitive spoof attempt and immediately fails
+        # the challenge, bypassing all other game logic for this frame.
+        if self.state in (LivenessState.ACTIVE, LivenessState.DEBOUNCE):
+            if self._anti_spoof.analyze().is_suspicious:
+                self._spoof_consecutive += 1
+                if self._spoof_consecutive >= cfg.anti_spoof.block_frames:
+                    self._spoof_blocked = True
+                    self.state = LivenessState.FAILED
+                    self._result_at = now
+                    self.streak = 0
+                    return self.state
+            else:
+                self._spoof_consecutive = 0
+
         # Timer starts on first hand detection (or immediately for peek-a-boo).
         if self._challenge_start is None:
             if self.current_cmd.cmd_type == CmdType.PEEK_A_BOO:
@@ -565,12 +594,28 @@ class LivenessChallenge:
         if self.state == LivenessState.SUCCESS:
             return "Status: Challenge Passed"
         if self.state == LivenessState.FAILED:
-            return "Status: Time's Up!"
+            return "Status: Spoof Blocked!" if self._spoof_blocked else "Status: Time's Up!"
         if self.state == LivenessState.DEBOUNCE:
             return "Status: Confirming..."
         if self._challenge_start is None:
             return "Status: Show your hand to start"
         return "Status: Respond NOW!"
+
+    @property
+    def is_spoof_blocked(self) -> bool:
+        """True when the most recent FAILED was caused by the anti-spoof gate."""
+        return self._spoof_blocked
+
+    @property
+    def spoof_warning_progress(self) -> float:
+        """0.0-1.0 charge toward the block threshold.
+
+        Drives a HUD warning bar so the user (and security operator) can see
+        the anti-spoof gate building up before it fires.  Returns 0.0 when no
+        suspicious frames have been accumulated this challenge.
+        """
+        limit = cfg.anti_spoof.block_frames
+        return min(self._spoof_consecutive / limit, 1.0) if limit > 0 else 0.0
 
     @property
     def is_flash_red(self) -> bool:
@@ -631,6 +676,8 @@ class LivenessChallenge:
     def reset(self) -> None:
         self.score = 0
         self.streak = 0
+        self._spoof_consecutive = 0
+        self._spoof_blocked = False
         self._anti_spoof.reset()
         self._build_queue()
         self._pick_next()

@@ -38,6 +38,11 @@ from sequential_session import SequentialSession, SeqState, StepResult
 from finger_touch_session import FingerTouchSession, TouchTestState
 from tracing_evaluator import TracingEvaluator
 from shape_trace_eval_session import ShapeTraceEvalSession, EvalMode, _EvalState
+from active_liveness_manager import (
+    ActiveLivenessSession, ALMState, ChallengeType, NUM_CHALLENGES,
+    TRANSITION_DURATION as _ALM_TRANSITION_DURATION,
+    _MathAdapter, _LivenessAdapter,
+)
 
 
 # -- colour palette -------------------------------------------------------
@@ -50,7 +55,7 @@ MAGENTA = (200, 50, 255)
 ORANGE = (0, 160, 255)
 DARK_BG = (40, 40, 40)
 
-MODE_NAMES = ["Normal", "Math", "Liveness", "Sequential", "Touch Test", "Shape Eval"]
+MODE_NAMES = ["Normal", "Math", "Liveness", "Sequential", "Touch Test", "Shape Eval", "Active Liveness"]
 
 
 # ── GameManager ─────────────────────────────────────────────────────
@@ -92,6 +97,7 @@ class GameManager:
             dtw_threshold=0.25,
             auto_advance=True,
         )
+        self.active_liveness = ActiveLivenessSession()
 
         self.hands_present = False
 
@@ -111,6 +117,8 @@ class GameManager:
             self.touch_test.reset()
         elif self.current_mode == 5:
             self.shape_eval.reset()
+        elif self.current_mode == 6:
+            self.active_liveness.reset()
 
     def restart(self):
         if self.current_mode == 0:
@@ -125,6 +133,8 @@ class GameManager:
             self.touch_test.reset()
         elif self.current_mode == 5:
             self.shape_eval.reset()
+        elif self.current_mode == 6:
+            self.active_liveness.reset()
 
     def update(self, hands: list[HandResult]):
         """Global hand-presence check, then delegate to active mode.
@@ -149,6 +159,8 @@ class GameManager:
             self.touch_test.update(hands)
         elif self.current_mode == 5:
             self.shape_eval.update(hands)
+        elif self.current_mode == 6:
+            self.active_liveness.update(hands)
 
 
 # ── Drawing utilities ───────────────────────────────────────────────
@@ -1027,9 +1039,279 @@ def draw_shape_eval_hud(frame, gm: GameManager, hands):
                      font_scale=0.38, color=WHITE, bg=(20, 20, 20))
 
 
+def draw_active_liveness_hud(frame, gm: GameManager, hands):
+    """HUD for the unified Active Liveness mode (mode 6).
+
+    Layout (top-left corner, consistent with existing liveness HUD)
+    ---------------------------------------------------------------
+    TRANSITION   "Next Task" countdown + upcoming challenge badge
+    CHALLENGE    Challenge-type badge + task-specific sub-HUD
+    COMPLETE     Score gauge + per-challenge breakdown + verdict
+    """
+    alm = gm.active_liveness
+    h, w = frame.shape[:2]
+
+    # ── Colour badges per challenge type ─────────────────────────────
+    TYPE_COLORS = {
+        ChallengeType.MATH:    CYAN,
+        ChallengeType.GESTURE: YELLOW,
+        ChallengeType.TOUCH:   ORANGE,
+        ChallengeType.TRACE:   MAGENTA,
+    }
+
+    def _badge(ct: ChallengeType, x: int, y: int) -> None:
+        col = TYPE_COLORS.get(ct, WHITE)
+        put_text_with_bg(frame, f"[ {ct.label} ]", (x, y),
+                         font_scale=0.6, color=col, thickness=2)
+
+    # ── TRANSITION screen ─────────────────────────────────────────────
+    if alm.state == ALMState.TRANSITION:
+        ut = alm.upcoming_type
+        rem = alm.transition_remaining
+
+        # Semi-dark overlay to signal the break.
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (10, 10, 30), -1)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+        put_text_centered(frame, "NEXT TASK", h // 2 - 55,
+                          font_scale=1.3, color=WHITE, thickness=3)
+        if ut is not None:
+            col = TYPE_COLORS.get(ut, WHITE)
+            put_text_centered(frame, f"[ {ut.label} ]", h // 2,
+                              font_scale=1.0, color=col, thickness=2)
+            put_text_centered(frame, ut.description, h // 2 + 45,
+                              font_scale=0.55, color=WHITE)
+
+        # Countdown bar at the bottom.
+        prog = 1.0 - (rem / max(_ALM_TRANSITION_DURATION, 0.001))
+        draw_progress_bar(frame, prog, y=h - 30,
+                          color_full=GREEN, color_fill=YELLOW)
+        put_text_with_bg(frame, f"Starting in {rem:.1f}s", (20, h - 50),
+                         font_scale=0.55, color=YELLOW)
+
+        # Completed challenges so far (small top-left panel).
+        put_text_with_bg(frame, alm.progress_text, (20, 30),
+                         font_scale=0.6, color=CYAN)
+        for i, line in enumerate(alm.results_text):
+            put_text_with_bg(frame, line, (20, 60 + i * 24),
+                             font_scale=0.5, color=WHITE)
+        return
+
+    # ── COMPLETE screen ───────────────────────────────────────────────
+    if alm.state == ALMState.COMPLETE:
+        score      = alm.active_liveness_score
+        verified   = alm.is_verified
+        score_pct  = int(score * 100)
+        score_col  = GREEN if score_pct >= 80 else YELLOW if score_pct >= 50 else RED
+        verdict    = "LIVENESS VERIFIED" if verified else "NOT VERIFIED"
+        v_col      = GREEN if verified else RED
+
+        # Score ring (centre).
+        cx, cy, rad = w // 2, h // 2 - 30, 70
+        cv2.circle(frame, (cx, cy), rad, DARK_BG, -1)
+        cv2.circle(frame, (cx, cy), rad, WHITE, 2)
+        angle = int(360 * score)
+        if angle > 0:
+            cv2.ellipse(frame, (cx, cy), (rad - 4, rad - 4),
+                        -90, 0, angle, score_col, 8)
+        put_text_centered(frame, f"{score_pct}%", cy,
+                          font_scale=1.1, color=score_col, thickness=3)
+
+        put_text_centered(frame, verdict, h // 2 + 55,
+                          font_scale=1.0, color=v_col, thickness=3)
+        put_text_centered(frame, f"Score: {score:.4f}", h // 2 + 88,
+                          font_scale=0.6, color=WHITE)
+        put_text_centered(frame, f"Session: {alm.session_duration_s:.1f}s",
+                          h // 2 + 110, font_scale=0.55, color=WHITE)
+
+        # Per-challenge breakdown (top-left).
+        put_text_with_bg(frame, "Results:", (20, 30),
+                         font_scale=0.6, color=CYAN, thickness=2)
+        for i, r in enumerate(alm.results):
+            icon  = "PASS" if r.passed else "FAIL"
+            i_col = GREEN  if r.passed else RED
+            q_str = f" ({r.quality*100:.0f}%)" if r.challenge_type == ChallengeType.TRACE else ""
+            put_text_with_bg(frame,
+                             f"{icon}  {r.challenge_type.label}{q_str}  {r.duration_s:.1f}s",
+                             (20, 58 + i * 26),
+                             font_scale=0.52, color=i_col)
+
+        put_text_centered(frame, "Press R to restart", h - 30,
+                          font_scale=0.6, color=YELLOW)
+        return
+
+    # ── CHALLENGE screen ──────────────────────────────────────────────
+    ct  = alm.current_type
+    cur = alm._current
+
+    # Progress + type badge (always top-left).
+    put_text_with_bg(frame, alm.progress_text, (20, 30),
+                     font_scale=0.6, color=CYAN)
+    _badge(ct, 20, 58)
+
+    # Completed challenges so far.
+    for i, line in enumerate(alm.results_text):
+        put_text_with_bg(frame, line, (20, 86 + i * 22),
+                         font_scale=0.48, color=WHITE)
+
+    # ── MATH sub-HUD ─────────────────────────────────────────────────
+    if ct == ChallengeType.MATH and isinstance(cur, _MathAdapter):
+        ms = cur.math_state
+
+        eq_col = GREEN if ms == MathState.SUCCESS else RED if ms == MathState.GAME_OVER else CYAN
+        put_text_centered(frame, cur.label, h // 2 - 30,
+                          font_scale=1.4, color=eq_col, thickness=3)
+
+        if ms == MathState.SUCCESS:
+            put_text_centered(frame, "CORRECT!", h // 2 + 20,
+                              font_scale=1.0, color=GREEN, thickness=2)
+        elif ms == MathState.GAME_OVER:
+            put_text_centered(frame, "TIME'S UP!", h // 2 + 20,
+                              font_scale=1.0, color=RED, thickness=2)
+        else:
+            s_col = YELLOW if ms == MathState.HOLDING else WHITE
+            put_text_with_bg(frame,
+                             "Hold steady..." if ms == MathState.HOLDING
+                             else "Show answer in fingers",
+                             (20, h - 90), font_scale=0.65, color=s_col)
+            draw_progress_bar(frame, cur.hold_progress, y=h - 70,
+                              color_full=GREEN, color_fill=YELLOW)
+
+        rem   = cur.time_remaining
+        t_col = RED if rem < 8 else YELLOW if rem < 15 else WHITE
+        put_text_with_bg(frame, f"Time: {rem:.0f}s", (w - 170, 30),
+                         font_scale=0.75, color=t_col, thickness=2)
+
+        total = cur.detected_total
+        if total is not None:
+            c = GREEN if total == cur.answer else WHITE
+            put_text_with_bg(frame, f"Fingers: {total}", (20, h - 115),
+                             font_scale=0.7, color=c, thickness=2)
+
+        per_hand = cur.per_hand_counts(hands)
+        y_off = h - 55
+        for side in ("Left", "Right"):
+            if side in per_hand:
+                put_text_with_bg(frame, f"{side}: {per_hand[side]}",
+                                 (w - 180, y_off), font_scale=0.6)
+                y_off += 28
+
+    # ── GESTURE / TOUCH sub-HUD (delegates to liveness internals) ────
+    elif ct in (ChallengeType.GESTURE, ChallengeType.TOUCH) and isinstance(cur, _LivenessAdapter):
+        lv = cur.inner
+        ls = lv.state
+
+        if lv.is_flash_red:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 200), -1)
+            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+
+        # Countdown ring (top-right).
+        draw_countdown_ring(frame, lv.time_remaining, lv._effective_time_limit,
+                            w - 90, 90, radius=55)
+
+        if ls == LivenessState.SUCCESS:
+            put_text_centered(frame, "DONE!", h // 2 - 20,
+                              font_scale=1.4, color=GREEN, thickness=3)
+        elif ls == LivenessState.FAILED:
+            put_text_centered(frame, "FAILED!", h // 2 - 20,
+                              font_scale=1.4, color=RED, thickness=3)
+        else:
+            cmd_col = ORANGE if ls == LivenessState.DEBOUNCE else WHITE
+            put_text_centered(frame, lv.command_label, h // 2 - 20,
+                              font_scale=1.0, color=cmd_col, thickness=2)
+            if ls == LivenessState.DEBOUNCE:
+                draw_progress_bar(frame, lv.debounce_progress,
+                                  y=h // 2 + 10, color_full=GREEN, color_fill=ORANGE)
+                put_text_centered(frame, "Confirming...", h // 2 + 50,
+                                  font_scale=0.7, color=ORANGE)
+
+            # TOUCH: hold counter + progress bar.
+            if lv.is_touch_cmd:
+                frames = lv.touch_frame_count
+                f_col  = GREEN if frames >= 8 else YELLOW if frames >= 4 else WHITE
+                put_text_with_bg(frame, f"Hold: {frames}/10 frames",
+                                 (20, h - 125), font_scale=0.65, color=f_col)
+                draw_progress_bar(frame, lv.touch_frame_progress, y=h - 108,
+                                  color_full=GREEN, color_fill=YELLOW)
+
+        status_col = GREEN if ls == LivenessState.SUCCESS else RED if ls == LivenessState.FAILED else YELLOW
+        put_text_with_bg(frame, lv.status_label, (20, h - 90),
+                         font_scale=0.7, color=status_col)
+
+        per_hand = lv.per_hand_counts(hands)
+        y_off = h - 55
+        for side in ("Left", "Right"):
+            if side in per_hand:
+                put_text_with_bg(frame, f"{side}: {per_hand[side]}",
+                                 (w - 180, y_off), font_scale=0.6)
+                y_off += 28
+
+    # ── TRACE sub-HUD (reuses liveness shape-trace rendering) ────────
+    elif ct == ChallengeType.TRACE and isinstance(cur, _LivenessAdapter):
+        lv = cur.inner
+        ls = lv.state
+
+        if lv.is_flash_red:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 200), -1)
+            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+
+        # Template + live trace (drawn behind all text).
+        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+            st = lv.shape_tracer
+            _draw_shape_template(frame, st.template, w, h,
+                                 tracer_state=st.state,
+                                 position_progress=st.position_progress)
+            if st.state in (TracerState.TRACING, TracerState.VERIFIED,
+                            TracerState.FAILED):
+                _draw_traced_path(frame, st.traced_path, w, h)
+
+        # Countdown ring: hidden during pre-trace states; tracer timer during TRACING.
+        if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+            _st = lv.shape_tracer
+            if _st.state == TracerState.TRACING:
+                from shape_tracer import DEFAULT_DRAW_TIME as _DDT
+                draw_countdown_ring(frame, _st.time_remaining, _DDT,
+                                    w - 90, 90, radius=55)
+            elif _st.state not in (TracerState.INSTRUCTING, TracerState.IDLE,
+                                   TracerState.POSITIONING):
+                draw_countdown_ring(frame, lv.time_remaining,
+                                    lv._effective_time_limit,
+                                    w - 90, 90, radius=55)
+
+        if ls == LivenessState.SUCCESS:
+            put_text_centered(frame, "TRACED!", h // 2 - 20,
+                              font_scale=1.4, color=GREEN, thickness=3)
+            if lv.shape_tracer is not None:
+                pct   = lv.shape_tracer.similarity_pct
+                p_col = GREEN if pct >= 70 else YELLOW if pct >= 40 else RED
+                put_text_with_bg(frame,
+                                 f"Similarity: {pct:.0f}%  DTW: {lv.shape_tracer.dtw_cost:.3f}",
+                                 (20, h - 115), font_scale=0.55, color=p_col)
+        elif ls == LivenessState.FAILED:
+            put_text_centered(frame, "FAILED!", h // 2 - 20,
+                              font_scale=1.4, color=RED, thickness=3)
+            if lv.shape_tracer is not None:
+                pct = lv.shape_tracer.similarity_pct
+                put_text_with_bg(frame,
+                                 f"Similarity: {pct:.0f}%  (need DTW <= 0.25)",
+                                 (20, h - 115), font_scale=0.55, color=YELLOW)
+        else:
+            # Shape info panel (top-left, below the badge row).
+            if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
+                _draw_shape_info_panel(frame, lv.shape_tracer,
+                                       lv.shape_trace_label, w, h)
+
+        status_col = GREEN if ls == LivenessState.SUCCESS else RED if ls == LivenessState.FAILED else YELLOW
+        put_text_with_bg(frame, lv.status_label, (20, h - 90),
+                         font_scale=0.7, color=status_col)
+
+
 _HUD_DRAWERS = [draw_normal_hud, draw_math_hud,
                 draw_liveness_hud, draw_sequential_hud, draw_touch_test_hud,
-                draw_shape_eval_hud]
+                draw_shape_eval_hud, draw_active_liveness_hud]
 
 
 # ── Main loop ───────────────────────────────────────────────────────

@@ -234,7 +234,6 @@ class LivenessChallenge:
         self._result_at = None
         self._baseline_area = None
         self._current_area = None
-        self._was_drawing = False
         self._flip_phase = 0
         self._flip_baseline_z = None
         self._peekaboo_phase = 0

@@ -41,7 +41,8 @@ from shape_trace_eval_session import ShapeTraceEvalSession, EvalMode, _EvalState
 from active_liveness_manager import (
     ActiveLivenessSession, ALMState, ChallengeType, NUM_CHALLENGES,
     TRANSITION_DURATION as _ALM_TRANSITION_DURATION,
-    _MathAdapter, _LivenessAdapter,
+    TRACE_RETRY_DISPLAY as _ALM_RETRY_DURATION,
+    _MathAdapter, _LivenessAdapter, _TraceWithRetryAdapter,
 )
 
 
@@ -1132,10 +1133,11 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
             icon  = "PASS" if r.passed else "FAIL"
             i_col = GREEN  if r.passed else RED
             q_str = f" ({r.quality*100:.0f}%)" if r.challenge_type == ChallengeType.TRACE else ""
+            a_str = f" x{r.attempts}" if r.attempts > 1 else ""
             put_text_with_bg(frame,
-                             f"{icon}  {r.challenge_type.label}{q_str}  {r.duration_s:.1f}s",
-                             (20, 58 + i * 26),
-                             font_scale=0.52, color=i_col)
+                             f"{icon}  {r.challenge_type.label}{q_str}{a_str}  {r.duration_s:.1f}s",
+                             (20, 58 + i * 24),
+                             font_scale=0.50, color=i_col)
 
         put_text_centered(frame, "Press R to restart", h - 30,
                           font_scale=0.6, color=YELLOW)
@@ -1248,10 +1250,46 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
                                  (w - 180, y_off), font_scale=0.6)
                 y_off += 28
 
-    # ── TRACE sub-HUD (reuses liveness shape-trace rendering) ────────
-    elif ct == ChallengeType.TRACE and isinstance(cur, _LivenessAdapter):
+    # ── TRACE sub-HUD (with retry support) ───────────────────────────
+    elif ct == ChallengeType.TRACE and isinstance(cur, _TraceWithRetryAdapter):
+
+        # -- Retry screen (between attempt 1 fail and attempt 2 start) ----
+        if cur.in_retry_screen:
+            rem  = cur.retry_remaining
+            prog = 1.0 - (rem / max(_ALM_RETRY_DURATION, 0.001))
+
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (10, 10, 40), -1)
+            cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+            put_text_centered(frame, "RETRY", h // 2 - 55,
+                              font_scale=1.4, color=ORANGE, thickness=3)
+            put_text_centered(frame, "One more attempt — trace more carefully",
+                              h // 2, font_scale=0.6, color=WHITE)
+            if cur.attempt_qualities:
+                prev_q = cur.attempt_qualities[-1]
+                q_col  = GREEN if prev_q >= 0.7 else YELLOW if prev_q >= 0.4 else RED
+                put_text_centered(frame,
+                                  f"Attempt 1 similarity: {prev_q*100:.0f}%",
+                                  h // 2 + 35, font_scale=0.6, color=q_col)
+            draw_progress_bar(frame, prog, y=h - 30,
+                              color_full=ORANGE, color_fill=YELLOW)
+            put_text_with_bg(frame, f"Retrying in {rem:.1f}s",
+                             (20, h - 50), font_scale=0.55, color=YELLOW)
+            put_text_with_bg(frame,
+                             f"Attempt {cur.attempt_num} / {TRACE_MAX_ATTEMPTS}",
+                             (w - 220, 30), font_scale=0.6, color=ORANGE)
+            return
+
+        # -- Active trace attempt -----------------------------------------
         lv = cur.inner
         ls = lv.state
+
+        # Attempt badge (top-right).
+        a_col = ORANGE if cur.attempt_num > 1 else WHITE
+        put_text_with_bg(frame,
+                         f"Attempt {cur.attempt_num}/{TRACE_MAX_ATTEMPTS}",
+                         (w - 220, 30), font_scale=0.6, color=a_col)
 
         if lv.is_flash_red:
             overlay = frame.copy()
@@ -1290,6 +1328,12 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
                 put_text_with_bg(frame,
                                  f"Similarity: {pct:.0f}%  DTW: {lv.shape_tracer.dtw_cost:.3f}",
                                  (20, h - 115), font_scale=0.55, color=p_col)
+                # Show averaged score if this was a retry.
+                if cur.attempt_num > 1:
+                    avg = cur.quality
+                    put_text_with_bg(frame,
+                                     f"Averaged score: {avg*100:.0f}%  (both attempts)",
+                                     (20, h - 138), font_scale=0.5, color=ORANGE)
         elif ls == LivenessState.FAILED:
             put_text_centered(frame, "FAILED!", h // 2 - 20,
                               font_scale=1.4, color=RED, thickness=3)
@@ -1298,8 +1342,11 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
                 put_text_with_bg(frame,
                                  f"Similarity: {pct:.0f}%  (need DTW <= 0.25)",
                                  (20, h - 115), font_scale=0.55, color=YELLOW)
+            # If this was the last attempt, say so.
+            if cur.attempt_num >= TRACE_MAX_ATTEMPTS:
+                put_text_centered(frame, "No retries remaining",
+                                  h // 2 + 30, font_scale=0.65, color=RED)
         else:
-            # Shape info panel (top-left, below the badge row).
             if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
                 _draw_shape_info_panel(frame, lv.shape_tracer,
                                        lv.shape_trace_label, w, h)

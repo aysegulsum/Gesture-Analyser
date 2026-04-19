@@ -354,7 +354,7 @@ class LivenessChallenge:
     def _peekaboo_check(self, hands: list[HandResult]) -> bool:
         """Phase 0: Wait for hands to disappear (user covers face).
         Phase 1: Wait for hands to reappear."""
-        now = time.time()
+        now = time.monotonic()
         if self._peekaboo_phase == 0:
             if not hands:
                 self._peekaboo_phase = 1
@@ -375,7 +375,7 @@ class LivenessChallenge:
     # -- Main update ------------------------------------------------------
 
     def update(self, hands: list[HandResult]) -> LivenessState:
-        now = time.time()
+        now = time.monotonic()
         self._frame_counter += 1
 
         # Anti-spoof: feed data every frame, EXCEPT during Shape Tracing.
@@ -522,13 +522,13 @@ class LivenessChallenge:
     def time_remaining(self) -> float:
         if self._challenge_start is None:
             return self._effective_time_limit
-        return max(0.0, self._effective_time_limit - (time.time() - self._challenge_start))
+        return max(0.0, self._effective_time_limit - (time.monotonic() - self._challenge_start))
 
     @property
     def debounce_progress(self) -> float:
         if self._debounce_start is None:
             return 0.0
-        return min((time.time() - self._debounce_start) / self.debounce_seconds, 1.0)
+        return min((time.monotonic() - self._debounce_start) / self.debounce_seconds, 1.0)
 
     @property
     def area_change_pct(self) -> Optional[float]:
@@ -575,7 +575,7 @@ class LivenessChallenge:
     def is_flash_red(self) -> bool:
         if self.state != LivenessState.FAILED or self._result_at is None:
             return False
-        return (time.time() - self._result_at) < 0.6
+        return (time.monotonic() - self._result_at) < 0.6
 
     @property
     def is_wave_cmd(self) -> bool:

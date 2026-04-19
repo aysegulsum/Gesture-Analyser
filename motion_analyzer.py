@@ -67,7 +67,7 @@ class WaveDetector:
         self._data: deque[tuple[float, float]] = deque(maxlen=buffer_size)  # (time, x)
 
     def push(self, wrist_x: float) -> None:
-        self._data.append((time.time(), wrist_x))
+        self._data.append((time.monotonic(), wrist_x))
 
     @property
     def reversal_count(self) -> int:

@@ -94,7 +94,7 @@ class FingerTouchSession:
     # -- Public API -------------------------------------------------------
 
     def update(self, hands: list[HandResult]) -> TouchTestState:
-        now = time.time()
+        now = time.monotonic()
 
         if self.state == TouchTestState.COMPLETE:
             return self.state

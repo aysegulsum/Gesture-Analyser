@@ -420,7 +420,7 @@ def _draw_ghost_trace(frame, waypoints: list, w: int, h: int) -> None:
         y   = waypoints[k][1] + s * (waypoints[k + 1][1] - waypoints[k][1])
         return (int(x * w), int(y * h))
 
-    now_frac = (time.time() % PERIOD) / PERIOD
+    now_frac = (time.monotonic() % PERIOD) / PERIOD
 
     # Draw comet tail first (drawn before head so head sits on top).
     for i in range(TRAIL_N, 0, -1):
@@ -486,7 +486,7 @@ def _draw_shape_template(frame, template, w: int, h: int,
     if tracer_state in (TS.INSTRUCTING, TS.IDLE):
         # Pulsing ring — faster during IDLE to draw attention.
         speed  = 3.0 if tracer_state == TS.INSTRUCTING else 5.0
-        pulse  = 0.5 + 0.5 * math.sin(time.time() * speed)
+        pulse  = 0.5 + 0.5 * math.sin(time.monotonic() * speed)
         r_out  = int(12 + 8 * pulse)
         cv2.circle(frame, (sx, sy), r_out, GREEN, 2, lineType=cv2.LINE_AA)
         cv2.circle(frame, (sx, sy),      8, GREEN, -1)
@@ -1256,7 +1256,7 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
         snap_prog = cur.snapshot_progress
         buf_ratio = cur.buffer_ratio
         result    = cur.snapshot_result        # None / True / False
-        buf_sz    = cur.snapshot_buffer_size
+        buf_frames = cur.buffer_frame_count
         cd_total  = cur.snapshot_countdown_total
 
         # ── After verdict: show PASS / FAILED splash ──────────────────
@@ -1280,8 +1280,7 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
             # Buffer consistency indicator.
             b_col = GREEN if buf_ratio >= 0.8 else YELLOW if buf_ratio >= 0.5 else RED
             put_text_centered(frame,
-                              f"Pose consistency: {int(buf_ratio * buf_sz)}"
-                              f"/{buf_sz} frames",
+                              f"Pose consistency: {buf_ratio * 100:.0f}%",
                               h // 2 + 62, font_scale=0.55, color=b_col)
             return
 
@@ -1471,7 +1470,7 @@ def run():
     print("Gesture Validator -- 'M' cycle modes, 'R' restart, 'Q' quit.")
 
     # FPS counter state
-    _fps_prev_time = time.time()
+    _fps_prev_time = time.monotonic()
     _fps_value = 0.0
 
     with tracker:
@@ -1483,7 +1482,7 @@ def run():
             frame = cv2.flip(frame, 1)
 
             # -- FPS calculation ------------------------------------------
-            _now = time.time()
+            _now = time.monotonic()
             dt = _now - _fps_prev_time
             if dt > 0:
                 _fps_value = 0.7 * (1.0 / dt) + 0.3 * _fps_value

@@ -18,11 +18,13 @@ Selects 5 challenges from the pool (all 4 types guaranteed, 1 random repeat):
 
 Snapshot verification (GESTURE / TOUCH)
 ----------------------------------------
-  A prominent countdown ring counts down SNAPSHOT_COUNTDOWN (4 s).
-  During the countdown the system samples the pose every frame and
-  stores the last SNAPSHOT_BUFFER (5) boolean detections.
-  At T = 0 the verdict is: pass if ≥ SNAPSHOT_PASS_RATIO (60 %) of
-  those buffered frames detected the required pose, fail otherwise.
+  A prominent countdown ring counts down SNAPSHOT_COUNTDOWN (5 s).
+  During the countdown the system samples the pose every frame into
+  a time-stamped buffer.  No real-time correctness feedback is shown.
+  At T = 0 the last SNAPSHOT_STABILITY_WINDOW (0.5 s) of detections
+  is evaluated: pass if ≥ SNAPSHOT_PASS_RATIO (60 %) of those frames
+  detected the required pose, fail otherwise.  The time-based window
+  is frame-rate independent — it works identically at 15, 30, or 60 fps.
   TRACE is exempt — it uses the existing real-time DTW pipeline.
 
 State machine
@@ -41,8 +43,8 @@ Scoring
   Fail (any, all retries used)   →  quality = 0.0
 
   active_liveness_score = mean(qualities)       ∈ [0.0, 1.0]
-  is_verified            = score >= 0.67        (≥ 4 clean passes out of 5,
-                                                 or 3 passes + good trace quality)
+  is_verified            = score >= 0.67  AND every challenge TYPE has ≥ 1 pass
+                           (prevents skipping the hardest type via the duplicate slot)
 
 Backend integration
 -------------------
@@ -109,10 +111,10 @@ TRACE_RETRY_DISPLAY = 2.0   # seconds for the "Retrying..." screen between attem
 # Snapshot verification — shared by GESTURE and TOUCH challenges.
 # Both use the same "blind countdown → snapshot → verdict" pattern:
 # no real-time correctness feedback during the countdown.
-SNAPSHOT_COUNTDOWN  = 5.0   # seconds shown on countdown before evaluating pose
-SNAPSHOT_BUFFER     = 12    # last ~12 frames (~0.4 s at 30 fps) for stability
-SNAPSHOT_PASS_RATIO = 0.6   # ≥ 60 % of buffered frames must show the pose to pass
-SNAPSHOT_EVAL_DURATION = 0.7  # seconds to show "Captured..." before verdict
+SNAPSHOT_COUNTDOWN        = 5.0   # seconds shown on countdown before evaluating pose
+SNAPSHOT_STABILITY_WINDOW = 0.5   # last 0.5 s of detections evaluated at T=0
+SNAPSHOT_PASS_RATIO       = 0.6   # ≥ 60 % of windowed frames must show the pose to pass
+SNAPSHOT_EVAL_DURATION    = 0.7   # seconds to show "Captured..." before verdict
 
 
 # ── Public types ─────────────────────────────────────────────────────
@@ -177,13 +179,13 @@ class _MathAdapter:
 
         # After a correct result, hold for RESULT_DISPLAY_TIME then pass.
         if self._success_at is not None:
-            if time.time() - self._success_at >= RESULT_DISPLAY_TIME:
+            if time.monotonic() - self._success_at >= RESULT_DISPLAY_TIME:
                 return True
             return None
 
         # When the session enters RESULT and the answer was correct → pass.
         if state == MathState.RESULT and self._ses.last_result_correct:
-            self._success_at = time.time()
+            self._success_at = time.monotonic()
             return None
 
         if state == MathState.GAME_OVER:
@@ -273,10 +275,10 @@ class _LivenessAdapter:
 
         # Capture first FAILED frame; wait for display pause before returning.
         if self._failed_at is None and state == LivenessState.FAILED:
-            self._failed_at = time.time()
+            self._failed_at = time.monotonic()
 
         if self._failed_at is not None:
-            if time.time() - self._failed_at >= self._lv.pause_after_result:
+            if time.monotonic() - self._failed_at >= self._lv.pause_after_result:
                 return False
 
         return None
@@ -314,8 +316,14 @@ class _SnapshotLivenessAdapter:
          gives **no real-time correctness feedback** — the user cannot
          trial-and-error their way to the answer.
       3. At T = 0 a "Captured..." evaluating phase is shown briefly while
-         the system analyses the last ~12 buffered frames.
+         the system analyses the last SNAPSHOT_STABILITY_WINDOW (0.5 s)
+         of time-stamped detections.
       4. The verdict (PASS / FAIL) is revealed once evaluation completes.
+
+    The buffer is **time-based**, not frame-count-based: at any frame rate
+    the evaluation window is exactly SNAPSHOT_STABILITY_WINDOW seconds.
+    This prevents the stability check from being too narrow at 60 fps or
+    too wide at 15 fps.
 
     Evaluation pipeline (every frame during countdown)
     --------------------------------------------------
@@ -324,8 +332,9 @@ class _SnapshotLivenessAdapter:
     TOUCH    → FingerTouchDetector._is_touching_this_frame(hands)
                Raw single-frame Z-validated pinch check (no hold counter).
 
-    Both results are appended to a rolling deque(maxlen=SNAPSHOT_BUFFER).
-    At T = 0 the ratio pass/total is compared to SNAPSHOT_PASS_RATIO.
+    Both results are appended to a time-stamped deque.  At T = 0 only
+    entries within the last SNAPSHOT_STABILITY_WINDOW are considered.
+    The ratio of True entries is compared to SNAPSHOT_PASS_RATIO.
 
     Post-evaluation the result is held for RESULT_DISPLAY_TIME before the
     adapter returns True / False to the orchestrator.
@@ -339,10 +348,10 @@ class _SnapshotLivenessAdapter:
         self._challenge_type = challenge_type
 
         # Unified constants — same for GESTURE and TOUCH.
-        self._countdown   = SNAPSHOT_COUNTDOWN
-        self._buf_size    = SNAPSHOT_BUFFER
-        self._pass_ratio  = SNAPSHOT_PASS_RATIO
-        self._eval_dur    = SNAPSHOT_EVAL_DURATION
+        self._countdown       = SNAPSHOT_COUNTDOWN
+        self._stability_win   = SNAPSHOT_STABILITY_WINDOW
+        self._pass_ratio      = SNAPSHOT_PASS_RATIO
+        self._eval_dur        = SNAPSHOT_EVAL_DURATION
 
         # LivenessChallenge is used for:
         #   • command label / display helpers
@@ -362,10 +371,11 @@ class _SnapshotLivenessAdapter:
         self._lv.challenges_completed = 0
         self._lv._pick_next()
 
-        self._start = time.time()
+        self._start = time.monotonic()
 
-        # Rolling per-frame detection buffer.
-        self._buffer: deque[bool] = deque(maxlen=self._buf_size)
+        # Time-stamped detection buffer: (timestamp, detected_bool).
+        # No maxlen — pruned by timestamp each frame.
+        self._buffer: deque[tuple[float, bool]] = deque()
 
         # Internal detection state (never exposed to the HUD).
         self._detected_this_frame: bool = False
@@ -394,10 +404,18 @@ class _SnapshotLivenessAdapter:
             return td._is_touching_this_frame(hands) if td is not None else False
         return False
 
+    def _evaluate_window(self, now: float) -> float:
+        """Return the pass ratio for the last SNAPSHOT_STABILITY_WINDOW seconds."""
+        cutoff = now - self._stability_win
+        recent = [v for ts, v in self._buffer if ts >= cutoff]
+        if not recent:
+            return 0.0
+        return sum(recent) / len(recent)
+
     # -- Adapter public API -----------------------------------------------
 
     def update(self, hands: list) -> Optional[bool]:
-        now     = time.time()
+        now     = time.monotonic()
         elapsed = now - self._start
 
         # --- Holding the result display after the snapshot ---
@@ -409,7 +427,7 @@ class _SnapshotLivenessAdapter:
         # --- Evaluating phase: brief "Captured..." delay ---
         if self._evaluating:
             if now - self._eval_start >= self._eval_dur:
-                ratio  = sum(self._buffer) / len(self._buffer) if self._buffer else 0.0
+                ratio  = self._evaluate_window(self._eval_start)
                 passed = ratio >= self._pass_ratio
                 self._snapshot_result = passed
                 self._result_at       = now
@@ -419,7 +437,12 @@ class _SnapshotLivenessAdapter:
 
         # --- Countdown still running — sample every frame ---
         self._detected_this_frame = self._detect_this_frame(hands)
-        self._buffer.append(self._detected_this_frame)
+        self._buffer.append((now, self._detected_this_frame))
+
+        # Prune entries older than stability window + 1 s margin.
+        cutoff = now - self._stability_win - 1.0
+        while self._buffer and self._buffer[0][0] < cutoff:
+            self._buffer.popleft()
 
         # --- T = 0 reached: enter evaluating phase ---
         if elapsed >= self._countdown and not self._snapshot_taken:
@@ -449,12 +472,12 @@ class _SnapshotLivenessAdapter:
         """Seconds left on the countdown (clamped to 0 once expired)."""
         if self._snapshot_taken:
             return 0.0
-        return max(0.0, self._countdown - (time.time() - self._start))
+        return max(0.0, self._countdown - (time.monotonic() - self._start))
 
     @property
     def snapshot_progress(self) -> float:
         """Fraction of the countdown elapsed (0.0 → 1.0)."""
-        return min((time.time() - self._start) / self._countdown, 1.0)
+        return min((time.monotonic() - self._start) / self._countdown, 1.0)
 
     @property
     def snapshot_countdown_total(self) -> float:
@@ -462,9 +485,9 @@ class _SnapshotLivenessAdapter:
         return self._countdown
 
     @property
-    def snapshot_buffer_size(self) -> int:
-        """Buffer size used for this challenge (for rendering frame counts)."""
-        return self._buf_size
+    def stability_window(self) -> float:
+        """Length of the evaluation window in seconds."""
+        return self._stability_win
 
     @property
     def detected_this_frame(self) -> bool:
@@ -478,10 +501,20 @@ class _SnapshotLivenessAdapter:
 
     @property
     def buffer_ratio(self) -> float:
-        """Fraction of the rolling buffer frames that detected the pose."""
-        if not self._buffer:
+        """Fraction of frames within the stability window that detected the pose."""
+        now = time.monotonic()
+        cutoff = now - self._stability_win
+        recent = [v for ts, v in self._buffer if ts >= cutoff]
+        if not recent:
             return 0.0
-        return sum(self._buffer) / len(self._buffer)
+        return sum(recent) / len(recent)
+
+    @property
+    def buffer_frame_count(self) -> int:
+        """Number of frames currently in the stability window (for HUD)."""
+        now = time.monotonic()
+        cutoff = now - self._stability_win
+        return sum(1 for ts, _ in self._buffer if ts >= cutoff)
 
     @property
     def snapshot_taken(self) -> bool:
@@ -531,7 +564,7 @@ class _TraceWithRetryAdapter:
 
         # --- Retry screen (between attempts) ---
         if self._retry_start is not None:
-            if time.time() - self._retry_start >= TRACE_RETRY_DISPLAY:
+            if time.monotonic() - self._retry_start >= TRACE_RETRY_DISPLAY:
                 # Start fresh attempt
                 self._retry_start = None
                 self._adapter     = _LivenessAdapter(_SHAPE_CMDS, ChallengeType.TRACE)
@@ -558,7 +591,7 @@ class _TraceWithRetryAdapter:
         if self._attempt_num < TRACE_MAX_ATTEMPTS:
             # Queue the retry screen
             self._attempt_num += 1
-            self._retry_start  = time.time()
+            self._retry_start  = time.monotonic()
             return None         # keep returning None until retry screen times out
 
         # All attempts exhausted
@@ -589,7 +622,7 @@ class _TraceWithRetryAdapter:
     def retry_remaining(self) -> float:
         if self._retry_start is None:
             return 0.0
-        return max(0.0, TRACE_RETRY_DISPLAY - (time.time() - self._retry_start))
+        return max(0.0, TRACE_RETRY_DISPLAY - (time.monotonic() - self._retry_start))
 
     @property
     def attempt_num(self) -> int:
@@ -650,9 +683,9 @@ class ActiveLivenessSession:
             _MathAdapter | _LivenessAdapter | _TraceWithRetryAdapter
         ] = None
 
-        self._transition_start: float = time.time()
+        self._transition_start: float = time.monotonic()
         self._challenge_start:  float = 0.0
-        self._session_start:    float = time.time()
+        self._session_start:    float = time.monotonic()
 
         # Pre-build first adapter so it's ready when the transition ends.
         self._next = self._build_adapter(self._types[0])
@@ -675,7 +708,7 @@ class ActiveLivenessSession:
     # -- Main update -------------------------------------------------
 
     def update(self, hands: list[HandResult]) -> ALMState:
-        now = time.time()
+        now = time.monotonic()
 
         if self.state == ALMState.COMPLETE:
             return self.state
@@ -726,8 +759,18 @@ class ActiveLivenessSession:
         self.session_duration_s    = round(now - self._session_start, 2)
         contributions              = [(r.quality if r.passed else 0.0) for r in self.results]
         self.active_liveness_score = round(sum(contributions) / NUM_CHALLENGES, 4)
-        self.is_verified           = self.active_liveness_score >= VERIFIED_THRESHOLD
-        self.state                 = ALMState.COMPLETE
+
+        # Every challenge TYPE must have at least one pass.  Without this
+        # check an attacker could fail the hardest type (e.g. TRACE) and
+        # still reach the score threshold via the duplicate slot.
+        passed_types = {r.challenge_type for r in self.results if r.passed}
+        all_types_covered = passed_types >= set(ChallengeType)
+
+        self.is_verified = (
+            self.active_liveness_score >= VERIFIED_THRESHOLD
+            and all_types_covered
+        )
+        self.state = ALMState.COMPLETE
 
     # -- Display helpers ---------------------------------------------
 
@@ -748,7 +791,7 @@ class ActiveLivenessSession:
     def transition_remaining(self) -> float:
         if self.state != ALMState.TRANSITION:
             return 0.0
-        return max(0.0, TRANSITION_DURATION - (time.time() - self._transition_start))
+        return max(0.0, TRANSITION_DURATION - (time.monotonic() - self._transition_start))
 
     @property
     def results_text(self) -> list[str]:

@@ -284,7 +284,7 @@ class HandCalibrator:
         if self._start is None:
             return 0.0
         import time as _time
-        return min((_time.time() - self._start) / self._duration, 1.0)
+        return min((_time.monotonic() - self._start) / self._duration, 1.0)
 
     @property
     def offsets(self) -> dict[str, float]:
@@ -295,12 +295,12 @@ class HandCalibrator:
         if self._done:
             return
         if self._start is None:
-            self._start = _time.time()
+            self._start = _time.monotonic()
 
         for finger in Finger:
             self._samples[finger].append(finger_ratio(landmarks, finger))
 
-        if _time.time() - self._start >= self._duration:
+        if _time.monotonic() - self._start >= self._duration:
             self._compute()
             self._done = True
 

@@ -338,6 +338,7 @@ DEFAULT_RESAMPLE_N   = 50    # number of points for DTW comparison
 DEFAULT_MIN_HS       = 0.05  # minimum hand_scale — loosened for Z-axis flexibility
 DEFAULT_POS_HOLD     = 0.50  # seconds to hold at start point before TRACING
 DEFAULT_INSTRUCT_TIME = 3.0  # seconds to show instruction overlay
+HAND_LOSS_GRACE      = 0.5   # seconds hand can be absent before trace is ended
 
 
 @dataclass
@@ -387,10 +388,12 @@ class ShapeTracerSession:
     _was_index_open:  bool = field(init=False, default=False)
     # True once finger moves far enough from start to enable end trigger
     _start_armed:     bool = field(init=False, default=False)
+    # Grace period: hand lost timestamp (None = hand present)
+    _hand_lost_at:    Optional[float] = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.template        = generate_random_shape()
-        self._instruct_start = time.time()
+        self._instruct_start = time.monotonic()
 
     # -- Point recording (3-point moving-average smoothing) ---------------
 
@@ -412,9 +415,28 @@ class ShapeTracerSession:
     # -- Verification (runs in exactly one frame) -------------------------
 
     def _run_verification(self) -> None:
-        """Compute DTW similarity and transition to VERIFIED or FAILED."""
-        now = time.time()
-        if len(self._traced) < self.template.min_trace_points:
+        """Compute DTW similarity and transition to VERIFIED or FAILED.
+
+        Partial credit
+        --------------
+        Even when the trace doesn't meet the DTW threshold, the system
+        still computes a similarity score.  This lets the retry adapter
+        average qualities across attempts rather than treating every
+        failure as a flat 0 %.
+
+        If the traced path has too few points for meaningful resampling
+        (< 3), the trace is an outright failure with 0 % similarity.
+        For paths with 3+ points but fewer than ``min_trace_points``,
+        DTW is still computed but the result is always FAILED (the
+        similarity is still recorded for partial-credit scoring).
+        """
+        now       = time.monotonic()
+        n_traced  = len(self._traced)
+
+        # Absolute minimum: need at least 3 points to resample.
+        if n_traced < 3:
+            self.similarity = 0.0
+            self.dtw_cost   = 0.0
             self.state      = TracerState.FAILED
             self._result_at = now
             return
@@ -424,11 +446,24 @@ class ShapeTracerSession:
         t_norm = _centroid_normalise(t_rs)
         u_norm = _centroid_normalise(u_rs)
 
-        cost             = dtw_normalised_cost(t_norm, u_norm)
-        self.dtw_cost    = cost
-        self.similarity  = max(0.0, min(1.0, 1.0 - cost / self.dtw_threshold))
-        self.state       = TracerState.VERIFIED if cost <= self.dtw_threshold else TracerState.FAILED
-        self._result_at  = now
+        cost          = dtw_normalised_cost(t_norm, u_norm)
+        self.dtw_cost = cost
+
+        # Partial credit: use an exponential decay so scores taper off
+        # smoothly instead of clamping to 0 % at cost == threshold.
+        #   cost = 0           → similarity = 1.0
+        #   cost = threshold   → similarity ≈ 0.37  (1/e)
+        #   cost = 2*threshold → similarity ≈ 0.14
+        import math
+        self.similarity = max(0.0, min(1.0,
+            math.exp(-cost / self.dtw_threshold)
+        ))
+
+        # Pass only if cost ≤ threshold AND enough points were traced.
+        passed = (cost <= self.dtw_threshold
+                  and n_traced >= self.template.min_trace_points)
+        self.state      = TracerState.VERIFIED if passed else TracerState.FAILED
+        self._result_at = now
 
     # -- Main update ------------------------------------------------------
 
@@ -438,7 +473,7 @@ class ShapeTracerSession:
         Call this every frame; read ``state``, ``traced_path``, and
         ``template_waypoints`` to drive the HUD renderer.
         """
-        now = time.time()
+        now = time.monotonic()
 
         # ── INSTRUCTING ───────────────────────────────────────────────
         # Show instructions for instruction_duration seconds, then go IDLE.
@@ -471,15 +506,23 @@ class ShapeTracerSession:
         if self.state in (TracerState.VERIFIED, TracerState.FAILED):
             return self.state
 
-        # No hand detected → drop back from POSITIONING/TRACING to IDLE.
+        # No hand detected → grace period during TRACING, instant reset
+        # for POSITIONING.
         if not hands:
             if self.state == TracerState.TRACING:
-                # Complete with whatever was recorded (could be short).
-                self.state = TracerState.COMPLETED
+                # Allow brief hand loss (blink, occlusion) before ending.
+                if self._hand_lost_at is None:
+                    self._hand_lost_at = now
+                elif now - self._hand_lost_at >= HAND_LOSS_GRACE:
+                    self._hand_lost_at = None
+                    self.state = TracerState.COMPLETED
             elif self.state == TracerState.POSITIONING:
                 self._position_start = None
                 self.state = TracerState.IDLE
             return self.state
+
+        # Hand is back — clear the grace timer.
+        self._hand_lost_at = None
 
         hand = hands[0]
         lm   = hand.landmarks
@@ -557,6 +600,7 @@ class ShapeTracerSession:
         self._raw_buf.clear()
         self._was_index_open = False
         self._draw_start     = None
+        self._hand_lost_at   = None
 
     # -- Observable helpers for HUD ---------------------------------------
 
@@ -574,35 +618,35 @@ class ShapeTracerSession:
         """Seconds remaining in the TRACING window (0 when not tracing)."""
         if self._draw_start is None:
             return self.time_limit
-        return max(0.0, self.time_limit - (time.time() - self._draw_start))
+        return max(0.0, self.time_limit - (time.monotonic() - self._draw_start))
 
     @property
     def draw_progress(self) -> float:
         """0.0 → 1.0 fraction of the TRACING time window used."""
         if self._draw_start is None:
             return 0.0
-        return min((time.time() - self._draw_start) / self.time_limit, 1.0)
+        return min((time.monotonic() - self._draw_start) / self.time_limit, 1.0)
 
     @property
     def position_progress(self) -> float:
         """0.0 → 1.0 arc-fill for the POSITIONING countdown."""
         if self._position_start is None:
             return 0.0
-        return min((time.time() - self._position_start) / self.position_hold_time, 1.0)
+        return min((time.monotonic() - self._position_start) / self.position_hold_time, 1.0)
 
     @property
     def instruct_progress(self) -> float:
         """0.0 → 1.0 fraction of the instruction overlay elapsed."""
         if self._instruct_start is None:
             return 1.0
-        return min((time.time() - self._instruct_start) / max(self.instruction_duration, 0.001), 1.0)
+        return min((time.monotonic() - self._instruct_start) / max(self.instruction_duration, 0.001), 1.0)
 
     @property
     def instruct_remaining(self) -> float:
         """Seconds remaining in the instruction phase."""
         if self._instruct_start is None:
             return 0.0
-        return max(0.0, self.instruction_duration - (time.time() - self._instruct_start))
+        return max(0.0, self.instruction_duration - (time.monotonic() - self._instruct_start))
 
     @property
     def similarity_pct(self) -> float:
@@ -619,7 +663,7 @@ class ShapeTracerSession:
         self.state           = TracerState.INSTRUCTING
         self.similarity      = 0.0
         self.dtw_cost        = 0.0
-        self._instruct_start = time.time()
+        self._instruct_start = time.monotonic()
         self._result_at      = None
         self._position_start = None
         self._start_armed    = False

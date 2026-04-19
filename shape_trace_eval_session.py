@@ -156,7 +156,7 @@ class ShapeTraceEvalSession:
 
             self._sim_live_path = []
             self._sim_feed_idx  = 0
-            self._sim_start     = time.time()
+            self._sim_start     = time.monotonic()
 
         self.eval_state = _EvalState.RUNNING
 
@@ -173,7 +173,7 @@ class ShapeTraceEvalSession:
             time_taken  = time_taken,
             attack_type = attack_type,
         )
-        self._result_at = time.time()
+        self._result_at = time.monotonic()
         self.eval_state = _EvalState.RESULT
 
     # -- Main update ------------------------------------------------------
@@ -185,7 +185,7 @@ class ShapeTraceEvalSession:
         ShapeTracerSession.  In attack modes, ``hands`` is ignored and the
         pre-generated path is fed at ``_ATTACK_FEED_RATE`` points / frame.
         """
-        now = time.time()
+        now = time.monotonic()
         self._frame_counter += 1
 
         # ── Auto-advance after result pause ──────────────────────────

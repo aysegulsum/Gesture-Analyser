@@ -43,8 +43,6 @@ from active_liveness_manager import (
     TRANSITION_DURATION as _ALM_TRANSITION_DURATION,
     TRACE_RETRY_DISPLAY as _ALM_RETRY_DURATION,
     TRACE_MAX_ATTEMPTS,
-    SNAPSHOT_COUNTDOWN as _ALM_SNAPSHOT_COUNTDOWN,
-    SNAPSHOT_BUFFER    as _ALM_SNAPSHOT_BUFFER,
     _MathAdapter, _SnapshotLivenessAdapter,
     _TraceWithRetryAdapter,
 )
@@ -80,7 +78,7 @@ class GameManager:
             targets=list(range(1, 11)), smoothing_window=7,
         )
         self.math = MathSession(
-            stability_seconds=2.0, pause_after_success=1.5,
+            question_duration=10.0,
             game_duration=60.0, smoothing_window=7,
         )
         self.liveness = LivenessChallenge(
@@ -198,18 +196,34 @@ def draw_progress_bar(frame, progress: float, y: int = 70, color_full=GREEN, col
     cv2.rectangle(frame, (x_start, y), (x_start + bar_w, y + 18), WHITE, 1)
 
 
-def draw_countdown_ring(frame, remaining, total, cx, cy, radius=60):
-    progress = max(0.0, remaining / total)
-    angle = int(360 * progress)
+def draw_countdown_ring(frame, remaining, total, cx, cy, radius=60,
+                        verified=False):
+    """Draw a countdown ring with arc, or a green checkmark when verified."""
     cv2.circle(frame, (cx, cy), radius, DARK_BG, -1)
     cv2.circle(frame, (cx, cy), radius, WHITE, 2)
+
+    if verified:
+        # Green filled ring + checkmark glyph.
+        cv2.ellipse(frame, (cx, cy), (radius - 4, radius - 4),
+                    -90, 0, 360, GREEN, 6)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        check = "\u2713"  # ✓
+        (tw, th), _ = cv2.getTextSize(check, font, 1.2, 3)
+        cv2.putText(frame, check, (cx - tw // 2, cy + th // 2),
+                    font, 1.2, GREEN, 3)
+        return
+
+    progress = max(0.0, remaining / total) if total > 0 else 0.0
+    angle = int(360 * progress)
     color = GREEN if remaining > 2 else YELLOW if remaining > 1 else RED
     if angle > 0:
-        cv2.ellipse(frame, (cx, cy), (radius - 4, radius - 4), -90, 0, angle, color, 6)
+        cv2.ellipse(frame, (cx, cy), (radius - 4, radius - 4),
+                    -90, 0, angle, color, 6)
     text = f"{remaining:.1f}"
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), _ = cv2.getTextSize(text, font, 1.0, 2)
-    cv2.putText(frame, text, (cx - tw // 2, cy + th // 2), font, 1.0, color, 2)
+    cv2.putText(frame, text, (cx - tw // 2, cy + th // 2),
+                font, 1.0, color, 2)
 
 
 # ── Per-mode HUD renderers ──────────────────────────────────────────
@@ -247,31 +261,46 @@ def draw_math_hud(frame, gm: GameManager, hands):
     h, w = frame.shape[:2]
     ms = ses.state
 
-    eq_color = RED if ms == MathState.GAME_OVER else GREEN if ms == MathState.SUCCESS else CYAN
+    eq_color = (GREEN if ms == MathState.RESULT and ses.last_result_correct
+                else RED if ms == MathState.GAME_OVER or (ms == MathState.RESULT and not ses.last_result_correct)
+                else CYAN)
     put_text_centered(frame, ses.equation_text, h // 2 - 30, font_scale=1.5, color=eq_color, thickness=3)
 
     if ms == MathState.GAME_OVER:
         put_text_centered(frame, ses.display_text, h // 2 + 30, font_scale=1.0, color=RED, thickness=2)
         put_text_centered(frame, "Press R to restart", h // 2 + 70, font_scale=0.7, color=YELLOW)
-    elif ms == MathState.SUCCESS:
-        put_text_centered(frame, "CORRECT!", h // 2 + 30, font_scale=1.0, color=GREEN, thickness=2)
+    elif ms == MathState.RESULT:
+        if ses.last_result_correct:
+            put_text_centered(frame, "CORRECT!", h // 2 + 30, font_scale=1.0, color=GREEN, thickness=2)
+        else:
+            put_text_centered(frame, f"WRONG — answer was {ses.answer}", h // 2 + 30,
+                              font_scale=0.8, color=RED, thickness=2)
+    elif ms == MathState.EVALUATING:
+        put_text_centered(frame, "Processing...", h // 2 + 30, font_scale=1.0, color=YELLOW, thickness=2)
     else:
-        status_color = YELLOW if ms == MathState.HOLDING else WHITE
-        put_text_with_bg(frame, ses.status_label, (20, 110), font_scale=0.7, color=status_color)
-        draw_progress_bar(frame, ses.hold_progress)
+        # COUNTDOWN — no correctness feedback, just show question timer.
+        q_rem = ses.question_time_remaining
+        put_text_with_bg(frame, f"Show your answer ({q_rem:.0f}s)", (20, 110),
+                         font_scale=0.7, color=WHITE)
+        draw_progress_bar(frame, 1.0 - ses.question_progress)
 
     remaining = ses.time_remaining
     timer_color = RED if remaining < 10 else YELLOW if remaining < 30 else WHITE
     put_text_with_bg(frame, f"Time: {remaining:.0f}s", (w - 180, 40), font_scale=0.8, color=timer_color, thickness=2)
     put_text_with_bg(frame, f"Score: {ses.score}", (20, 40), font_scale=0.8, color=GREEN, thickness=2)
 
-    per_hand = ses.per_hand_counts(hands)
-    total = ses.detected_total()
-    y_off = h - 80
-    for label in ("Left", "Right"):
-        if label in per_hand:
-            put_text_with_bg(frame, f"{label}: {per_hand[label]}", (20, y_off), font_scale=0.6)
-            y_off += 28
+    if ms == MathState.COUNTDOWN:
+        per_hand = ses.per_hand_counts(hands)
+        total = ses.detected_total()
+        y_off = h - 80
+        # Show finger count without correctness color hint.
+        if total is not None:
+            put_text_with_bg(frame, f"Fingers: {total}", (20, y_off - 28),
+                             font_scale=0.7, color=WHITE, thickness=2)
+        for label in ("Left", "Right"):
+            if label in per_hand:
+                put_text_with_bg(frame, f"{label}: {per_hand[label]}", (20, y_off), font_scale=0.6)
+                y_off += 28
     if total is not None:
         c = GREEN if total == ses.answer else WHITE
         put_text_with_bg(frame, f"Total: {total}", (20, y_off), font_scale=0.7, color=c, thickness=2)
@@ -1165,51 +1194,70 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
     if ct == ChallengeType.MATH and isinstance(cur, _MathAdapter):
         ms = cur.math_state
 
-        eq_col = GREEN if ms == MathState.SUCCESS else RED if ms == MathState.GAME_OVER else CYAN
+        eq_col = (GREEN if ms == MathState.RESULT and cur.last_result_correct
+                  else RED if ms in (MathState.GAME_OVER,) or (ms == MathState.RESULT and not cur.last_result_correct)
+                  else CYAN)
         put_text_centered(frame, cur.label, h // 2 - 30,
                           font_scale=1.4, color=eq_col, thickness=3)
 
-        if ms == MathState.SUCCESS:
-            put_text_centered(frame, "CORRECT!", h // 2 + 20,
-                              font_scale=1.0, color=GREEN, thickness=2)
+        if ms == MathState.RESULT:
+            if cur.last_result_correct:
+                put_text_centered(frame, "CORRECT!", h // 2 + 20,
+                                  font_scale=1.0, color=GREEN, thickness=2)
+            else:
+                put_text_centered(frame, f"WRONG — answer was {cur.answer}",
+                                  h // 2 + 20,
+                                  font_scale=0.8, color=RED, thickness=2)
+        elif ms == MathState.EVALUATING:
+            put_text_centered(frame, "Processing...", h // 2 + 20,
+                              font_scale=1.0, color=YELLOW, thickness=2)
         elif ms == MathState.GAME_OVER:
             put_text_centered(frame, "TIME'S UP!", h // 2 + 20,
                               font_scale=1.0, color=RED, thickness=2)
         else:
-            s_col = YELLOW if ms == MathState.HOLDING else WHITE
+            # COUNTDOWN — show remaining question time, no correctness hint.
+            q_rem = cur.question_time_remaining
             put_text_with_bg(frame,
-                             "Hold steady..." if ms == MathState.HOLDING
-                             else "Show answer in fingers",
-                             (20, h - 90), font_scale=0.65, color=s_col)
-            draw_progress_bar(frame, cur.hold_progress, y=h - 70,
+                             f"Show your answer — {q_rem:.0f}s",
+                             (20, h - 90), font_scale=0.65, color=WHITE)
+            # Progress bar: fills as countdown elapses (inverted so it drains).
+            draw_progress_bar(frame, 1.0 - cur.question_progress, y=h - 70,
                               color_full=GREEN, color_fill=YELLOW)
 
-        rem   = cur.time_remaining
-        t_col = RED if rem < 8 else YELLOW if rem < 15 else WHITE
-        put_text_with_bg(frame, f"Time: {rem:.0f}s", (w - 170, 30),
-                         font_scale=0.75, color=t_col, thickness=2)
+        # Unified countdown ring (top-right).
+        if ms in (MathState.RESULT, MathState.EVALUATING):
+            draw_countdown_ring(frame, 0, 1, w - 95, 95, radius=65,
+                                verified=True)
+        elif ms == MathState.GAME_OVER:
+            draw_countdown_ring(frame, 0, cur.question_duration,
+                                w - 95, 95, radius=65)
+        else:
+            draw_countdown_ring(frame, cur.question_time_remaining,
+                                cur.question_duration, w - 95, 95, radius=65)
 
+        # Show detected fingers (count only, NO color hint about correctness).
         total = cur.detected_total
-        if total is not None:
-            c = GREEN if total == cur.answer else WHITE
+        if total is not None and ms == MathState.COUNTDOWN:
             put_text_with_bg(frame, f"Fingers: {total}", (20, h - 115),
-                             font_scale=0.7, color=c, thickness=2)
+                             font_scale=0.7, color=WHITE, thickness=2)
 
-        per_hand = cur.per_hand_counts(hands)
-        y_off = h - 55
-        for side in ("Left", "Right"):
-            if side in per_hand:
-                put_text_with_bg(frame, f"{side}: {per_hand[side]}",
-                                 (w - 180, y_off), font_scale=0.6)
-                y_off += 28
+        if ms == MathState.COUNTDOWN:
+            per_hand = cur.per_hand_counts(hands)
+            y_off = h - 55
+            for side in ("Left", "Right"):
+                if side in per_hand:
+                    put_text_with_bg(frame, f"{side}: {per_hand[side]}",
+                                     (w - 180, y_off), font_scale=0.6)
+                    y_off += 28
 
-    # ── GESTURE / TOUCH sub-HUD (snapshot countdown verification) ────
+    # ── GESTURE / TOUCH sub-HUD (unified blind countdown verification) ─
     elif ct in (ChallengeType.GESTURE, ChallengeType.TOUCH) and isinstance(cur, _SnapshotLivenessAdapter):
         snap_rem  = cur.snapshot_remaining
         snap_prog = cur.snapshot_progress
-        detected  = cur.detected_this_frame
         buf_ratio = cur.buffer_ratio
-        result    = cur.snapshot_result   # None / True / False
+        result    = cur.snapshot_result        # None / True / False
+        buf_sz    = cur.snapshot_buffer_size
+        cd_total  = cur.snapshot_countdown_total
 
         # ── After verdict: show PASS / FAILED splash ──────────────────
         if result is not None:
@@ -1221,6 +1269,10 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
                           (0, 100, 0) if result else (0, 0, 120), -1)
             cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, frame)
 
+            # Verified checkmark ring (top-right).
+            draw_countdown_ring(frame, 0, 1, w - 95, 95, radius=65,
+                                verified=result)
+
             put_text_centered(frame, splash_txt, h // 2 - 25,
                               font_scale=1.8, color=splash_col, thickness=4)
             put_text_centered(frame, cur.label, h // 2 + 30,
@@ -1228,54 +1280,61 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
             # Buffer consistency indicator.
             b_col = GREEN if buf_ratio >= 0.8 else YELLOW if buf_ratio >= 0.5 else RED
             put_text_centered(frame,
-                              f"Pose consistency: {int(buf_ratio * _ALM_SNAPSHOT_BUFFER)}"
-                              f"/{_ALM_SNAPSHOT_BUFFER} frames",
+                              f"Pose consistency: {int(buf_ratio * buf_sz)}"
+                              f"/{buf_sz} frames",
                               h // 2 + 62, font_scale=0.55, color=b_col)
             return
 
-        # ── T = 0 reached but result_at not yet set (shouldn't linger,
-        #    but show "EVALUATING..." as a safe fallback) ─────────────
+        # ── Evaluating phase: "Captured — evaluating..." ─────────────
+        if cur.is_evaluating:
+            # Brief flash overlay to signal the snapshot moment.
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w, h), (255, 255, 255), -1)
+            cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+
+            # Stopped ring (0 remaining).
+            draw_countdown_ring(frame, 0, cd_total, w - 95, 95, radius=65)
+
+            put_text_centered(frame, cur.label, h // 2 - 50,
+                              font_scale=1.0, color=WHITE, thickness=2)
+            put_text_centered(frame, "Captured — evaluating...",
+                              h // 2 + 10, font_scale=1.0, color=CYAN, thickness=2)
+            return
+
+        # ── Fallback: snapshot_taken but not yet evaluating (rare) ────
         if cur.snapshot_taken:
+            draw_countdown_ring(frame, 0, cd_total, w - 95, 95, radius=65)
             put_text_centered(frame, cur.label, h // 2 - 50,
                               font_scale=1.0, color=WHITE, thickness=2)
             put_text_centered(frame, "EVALUATING...",
                               h // 2 + 10, font_scale=1.1, color=CYAN, thickness=2)
             return
 
-        # ── Countdown still running ───────────────────────────────────
+        # ── Countdown still running — blind (no correctness hints) ────
 
-        # Command label (centre, large).
-        cmd_col = GREEN if detected else WHITE
+        # Command label in neutral white.
         put_text_centered(frame, cur.label, h // 2 - 55,
-                          font_scale=1.0, color=cmd_col, thickness=2)
+                          font_scale=1.0, color=WHITE, thickness=2)
 
-        # Prominent countdown ring (top-right, larger than normal).
-        draw_countdown_ring(frame, snap_rem, _ALM_SNAPSHOT_COUNTDOWN,
+        # Prominent countdown ring (top-right).
+        draw_countdown_ring(frame, snap_rem, cd_total,
                             w - 95, 95, radius=65)
 
-        # "Pose detected" live badge (centre).
-        if detected:
-            put_text_centered(frame, "Pose detected ✓",
-                              h // 2 - 10, font_scale=0.85, color=GREEN, thickness=2)
-        else:
-            put_text_centered(frame, "Hold the pose...",
-                              h // 2 - 10, font_scale=0.75, color=YELLOW)
+        # Neutral instruction — no detection feedback.
+        put_text_centered(frame, "Perform the gesture and hold",
+                          h // 2 - 10, font_scale=0.75, color=WHITE)
 
-        # Buffer consistency bar (shows how steady the pose has been).
-        draw_progress_bar(frame, buf_ratio, y=h // 2 + 20,
+        # Countdown drain bar (remaining time visualisation).
+        draw_progress_bar(frame, 1.0 - snap_prog, y=h // 2 + 20,
                           color_full=GREEN, color_fill=YELLOW)
-        b_txt = f"Consistency: {int(buf_ratio * _ALM_SNAPSHOT_BUFFER)}/{_ALM_SNAPSHOT_BUFFER} frames"
-        b_col = GREEN if buf_ratio >= 0.8 else YELLOW if buf_ratio >= 0.4 else WHITE
-        put_text_centered(frame, b_txt, h // 2 + 50,
-                          font_scale=0.55, color=b_col)
 
-        # Snapshot countdown text (bottom-left).
+        # Countdown text (bottom-left).
         t_col = RED if snap_rem < 1.0 else YELLOW if snap_rem < 2.0 else WHITE
         put_text_with_bg(frame, f"Snapshot in {snap_rem:.1f}s",
                          (20, h - 90), font_scale=0.7, color=t_col, thickness=2)
 
         # Instruction hint (bottom of frame).
-        put_text_centered(frame, "Hold your pose — snapshot taken at 0:00",
+        put_text_centered(frame, "Hold your pose — captured at 0:00",
                           h - 55, font_scale=0.55, color=WHITE)
 
     # ── TRACE sub-HUD (with retry support) ───────────────────────────
@@ -1313,11 +1372,11 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
         lv = cur.inner
         ls = lv.state
 
-        # Attempt badge (top-right).
+        # Attempt badge (below the countdown ring).
         a_col = ORANGE if cur.attempt_num > 1 else WHITE
         put_text_with_bg(frame,
                          f"Attempt {cur.attempt_num}/{TRACE_MAX_ATTEMPTS}",
-                         (w - 220, 30), font_scale=0.6, color=a_col)
+                         (w - 165, 170), font_scale=0.6, color=a_col)
 
         if lv.is_flash_red:
             overlay = frame.copy()
@@ -1334,18 +1393,22 @@ def draw_active_liveness_hud(frame, gm: GameManager, hands):
                             TracerState.FAILED):
                 _draw_traced_path(frame, st.traced_path, w, h)
 
-        # Countdown ring: hidden during pre-trace states; tracer timer during TRACING.
+        # Unified countdown ring (top-right, same position as other challenges).
         if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
             _st = lv.shape_tracer
+            from shape_tracer import DEFAULT_DRAW_TIME as _DDT
             if _st.state == TracerState.TRACING:
-                from shape_tracer import DEFAULT_DRAW_TIME as _DDT
+                # Active tracing — show the 12-second tracer timer.
                 draw_countdown_ring(frame, _st.time_remaining, _DDT,
-                                    w - 90, 90, radius=55)
-            elif _st.state not in (TracerState.INSTRUCTING, TracerState.IDLE,
-                                   TracerState.POSITIONING):
-                draw_countdown_ring(frame, lv.time_remaining,
-                                    lv._effective_time_limit,
-                                    w - 90, 90, radius=55)
+                                    w - 95, 95, radius=65)
+            elif _st.state == TracerState.VERIFIED:
+                # Trace succeeded — show verified checkmark, timer frozen.
+                draw_countdown_ring(frame, 0, 1, w - 95, 95, radius=65,
+                                    verified=True)
+            elif _st.state == TracerState.FAILED:
+                # Trace failed — show empty (expired) ring.
+                draw_countdown_ring(frame, 0, _DDT, w - 95, 95, radius=65)
+            # Pre-trace states (INSTRUCTING, IDLE, POSITIONING): no ring.
 
         if ls == LivenessState.SUCCESS:
             put_text_centered(frame, "TRACED!", h // 2 - 20,

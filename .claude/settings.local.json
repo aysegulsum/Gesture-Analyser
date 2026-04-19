@@ -3,7 +3,10 @@
     "allow": [
       "Bash(pip install:*)",
       "Bash(python:*)",
-      "Bash(taskkill:*)"
+      "Bash(taskkill:*)",
+      "Bash(find .:*)",
+      "Bash(grep:*)",
+      "Bash(ls -la /c/Users/hp/PycharmProjects/PythonProject1/*.py)"
     ]
   }
 }

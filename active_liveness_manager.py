@@ -106,10 +106,13 @@ RESULT_DISPLAY_TIME = 1.2   # seconds to show pass/fail screen before advancing
 TRACE_MAX_ATTEMPTS  = 2     # 1 retry allowed on TRACE failure
 TRACE_RETRY_DISPLAY = 2.0   # seconds for the "Retrying..." screen between attempts
 
-# Snapshot verification (GESTURE / TOUCH challenges only)
-SNAPSHOT_COUNTDOWN  = 4.0   # seconds shown on countdown before evaluating pose
-SNAPSHOT_BUFFER     = 5     # last N frames of detection results averaged at T=0
+# Snapshot verification — shared by GESTURE and TOUCH challenges.
+# Both use the same "blind countdown → snapshot → verdict" pattern:
+# no real-time correctness feedback during the countdown.
+SNAPSHOT_COUNTDOWN  = 5.0   # seconds shown on countdown before evaluating pose
+SNAPSHOT_BUFFER     = 12    # last ~12 frames (~0.4 s at 30 fps) for stability
 SNAPSHOT_PASS_RATIO = 0.6   # ≥ 60 % of buffered frames must show the pose to pass
+SNAPSHOT_EVAL_DURATION = 0.7  # seconds to show "Captured..." before verdict
 
 
 # ── Public types ─────────────────────────────────────────────────────
@@ -161,8 +164,7 @@ class _MathAdapter:
 
     def __init__(self) -> None:
         self._ses = MathSession(
-            stability_seconds=2.0,
-            pause_after_success=1.5,
+            question_duration=10.0,
             game_duration=MATH_TIME_LIMIT,
             smoothing_window=7,
         )
@@ -173,12 +175,14 @@ class _MathAdapter:
     def update(self, hands: list[HandResult]) -> Optional[bool]:
         state = self._ses.update(hands)
 
+        # After a correct result, hold for RESULT_DISPLAY_TIME then pass.
         if self._success_at is not None:
             if time.time() - self._success_at >= RESULT_DISPLAY_TIME:
                 return True
             return None
 
-        if state == MathState.SUCCESS:
+        # When the session enters RESULT and the answer was correct → pass.
+        if state == MathState.RESULT and self._ses.last_result_correct:
             self._success_at = time.time()
             return None
 
@@ -199,12 +203,28 @@ class _MathAdapter:
         return self._ses.time_remaining
 
     @property
+    def question_time_remaining(self) -> float:
+        return self._ses.question_time_remaining
+
+    @property
+    def question_duration(self) -> float:
+        return self._ses.question_duration
+
+    @property
+    def question_progress(self) -> float:
+        return self._ses.question_progress
+
+    @property
     def hold_progress(self) -> float:
         return self._ses.hold_progress
 
     @property
     def math_state(self) -> MathState:
         return self._ses.state
+
+    @property
+    def last_result_correct(self) -> bool:
+        return self._ses.last_result_correct
 
     @property
     def detected_total(self) -> Optional[int]:
@@ -287,15 +307,15 @@ class _SnapshotLivenessAdapter:
     """
     Gesture / Touch adapter with countdown-based snapshot verification.
 
-    Instead of the continuous frame-by-frame hold that _LivenessAdapter uses,
-    this adapter shows a SNAPSHOT_COUNTDOWN timer to the user.  At T = 0 the
-    system evaluates the pose that was held over the last SNAPSHOT_BUFFER
-    frames.  If at least SNAPSHOT_PASS_RATIO of those frames detected the
-    required gesture/touch, the challenge passes.
+    Both GESTURE and TOUCH challenges follow the same blind pattern:
 
-    This feels more natural than a silent debounce window: the user sees a
-    ticking ring, holds the pose, and the verdict is delivered all at once
-    when the ring completes.
+      1. A 5-second countdown timer is displayed.
+      2. During the countdown the system detects the pose every frame but
+         gives **no real-time correctness feedback** — the user cannot
+         trial-and-error their way to the answer.
+      3. At T = 0 a "Captured..." evaluating phase is shown briefly while
+         the system analyses the last ~12 buffered frames.
+      4. The verdict (PASS / FAIL) is revealed once evaluation completes.
 
     Evaluation pipeline (every frame during countdown)
     --------------------------------------------------
@@ -316,6 +336,14 @@ class _SnapshotLivenessAdapter:
     def __init__(self, pool: list, challenge_type: ChallengeType) -> None:
         chosen_cmd = random.choice(pool)
 
+        self._challenge_type = challenge_type
+
+        # Unified constants — same for GESTURE and TOUCH.
+        self._countdown   = SNAPSHOT_COUNTDOWN
+        self._buf_size    = SNAPSHOT_BUFFER
+        self._pass_ratio  = SNAPSHOT_PASS_RATIO
+        self._eval_dur    = SNAPSHOT_EVAL_DURATION
+
         # LivenessChallenge is used for:
         #   • command label / display helpers
         #   • _gesture_matched()  (uses the smoothed GestureValidator)
@@ -323,7 +351,7 @@ class _SnapshotLivenessAdapter:
         # Its own time-limit is set very high so it never auto-fires during
         # our countdown; we bypass its state machine entirely for verdicts.
         self._lv = LivenessChallenge(
-            time_limit=SNAPSHOT_COUNTDOWN + 60.0,
+            time_limit=self._countdown + 60.0,
             debounce_seconds=0.5,
             area_change_threshold=0.20,
             pause_after_result=RESULT_DISPLAY_TIME,
@@ -334,17 +362,18 @@ class _SnapshotLivenessAdapter:
         self._lv.challenges_completed = 0
         self._lv._pick_next()
 
-        self._challenge_type = challenge_type
-        self._start          = time.time()
+        self._start = time.time()
 
         # Rolling per-frame detection buffer.
-        self._buffer: deque[bool] = deque(maxlen=SNAPSHOT_BUFFER)
+        self._buffer: deque[bool] = deque(maxlen=self._buf_size)
 
-        # Live feedback for the HUD.
+        # Internal detection state (never exposed to the HUD).
         self._detected_this_frame: bool = False
 
-        # Post-snapshot verdict.
+        # Post-snapshot states.
         self._snapshot_taken:  bool          = False
+        self._evaluating:      bool          = False
+        self._eval_start:      Optional[float] = None
         self._snapshot_result: Optional[bool] = None
         self._result_at:       Optional[float] = None
 
@@ -377,18 +406,26 @@ class _SnapshotLivenessAdapter:
                 return self._snapshot_result
             return None
 
+        # --- Evaluating phase: brief "Captured..." delay ---
+        if self._evaluating:
+            if now - self._eval_start >= self._eval_dur:
+                ratio  = sum(self._buffer) / len(self._buffer) if self._buffer else 0.0
+                passed = ratio >= self._pass_ratio
+                self._snapshot_result = passed
+                self._result_at       = now
+                self.quality          = 1.0 if passed else 0.0
+                self._evaluating      = False
+            return None
+
         # --- Countdown still running — sample every frame ---
         self._detected_this_frame = self._detect_this_frame(hands)
         self._buffer.append(self._detected_this_frame)
 
-        # --- T = 0 reached: evaluate the buffer ---
-        if elapsed >= SNAPSHOT_COUNTDOWN and not self._snapshot_taken:
-            self._snapshot_taken  = True
-            ratio  = sum(self._buffer) / len(self._buffer) if self._buffer else 0.0
-            passed = ratio >= SNAPSHOT_PASS_RATIO
-            self._snapshot_result = passed
-            self._result_at       = now
-            self.quality          = 1.0 if passed else 0.0
+        # --- T = 0 reached: enter evaluating phase ---
+        if elapsed >= self._countdown and not self._snapshot_taken:
+            self._snapshot_taken = True
+            self._evaluating     = True
+            self._eval_start     = now
 
         return None
 
@@ -412,17 +449,32 @@ class _SnapshotLivenessAdapter:
         """Seconds left on the countdown (clamped to 0 once expired)."""
         if self._snapshot_taken:
             return 0.0
-        return max(0.0, SNAPSHOT_COUNTDOWN - (time.time() - self._start))
+        return max(0.0, self._countdown - (time.time() - self._start))
 
     @property
     def snapshot_progress(self) -> float:
         """Fraction of the countdown elapsed (0.0 → 1.0)."""
-        return min((time.time() - self._start) / SNAPSHOT_COUNTDOWN, 1.0)
+        return min((time.time() - self._start) / self._countdown, 1.0)
+
+    @property
+    def snapshot_countdown_total(self) -> float:
+        """Total countdown duration (for rendering the ring/bar)."""
+        return self._countdown
+
+    @property
+    def snapshot_buffer_size(self) -> int:
+        """Buffer size used for this challenge (for rendering frame counts)."""
+        return self._buf_size
 
     @property
     def detected_this_frame(self) -> bool:
-        """True when the current frame shows the required pose."""
-        return self._detected_this_frame
+        """Always False — real-time correctness is never exposed to the UI."""
+        return False
+
+    @property
+    def is_evaluating(self) -> bool:
+        """True during the brief 'Captured...' phase between countdown and result."""
+        return self._evaluating
 
     @property
     def buffer_ratio(self) -> float:

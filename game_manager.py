@@ -86,6 +86,20 @@ class GameManager:
     def mode_name(self) -> str:
         return self.modes[self.current_mode]
 
+    @property
+    def suppress_no_hand_overlay(self) -> bool:
+        """True when the active challenge renders a centred shape guide that
+        the generic 'No Hand Detected' overlay would otherwise cover.
+
+        During a SHAPE_TRACE liveness challenge (and throughout Shape Eval
+        mode) the shape sits in the middle of the frame; the centred no-hand
+        text flickers on top of it whenever tracking briefly drops — and the
+        Shape Eval attack modes run with no hand at all — so we suppress it.
+        """
+        if self.current_mode == 5:          # Shape Eval (always centred shape)
+            return True
+        return self.current_mode == 2 and self.liveness.is_shape_trace_cmd
+
     # ── Audit log helpers ────────────────────────────────────────────────
 
     def _reset_log_state(self):

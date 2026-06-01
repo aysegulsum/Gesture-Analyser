@@ -261,41 +261,35 @@ def _draw_shape_template(frame, template, w: int, h: int,
 
 
 def _draw_shape_info_panel(frame, st, label: str, w: int, h: int) -> None:
-    """Render shape-tracing status as text lines at a fixed top-left position."""
-    TS     = TracerState
-    TX     = 20
-    TY     = 130
-    LINE_H = 24
+    """Render shape-tracing status as a single compact line.
+
+    Kept to ONE line placed in the clear band just above the centred shape
+    (below the score line, above the shape's top edge) so the guide and the
+    user's trace in the centre of the frame are never covered by text boxes.
+    """
+    TS = TracerState
+    TX = 20
+    TY = 110
 
     if st.state == TS.INSTRUCTING:
         rem = st.instruct_remaining
-        put_text_with_bg(frame, f"{label}  —  Trace the shape",
+        put_text_with_bg(frame, f"{label}  —  hover finger on green START  (starts {rem:.1f}s)",
                          (TX, TY), font_scale=0.55, color=CYAN)
-        put_text_with_bg(frame, "Hover index finger over the green START dot.",
-                         (TX, TY + LINE_H), font_scale=0.55, color=WHITE)
-        put_text_with_bg(frame, f"Auto-starts in {rem:.1f} s",
-                         (TX, TY + LINE_H * 2), font_scale=0.55, color=YELLOW)
 
     elif st.state == TS.IDLE:
-        put_text_with_bg(frame, f"{label}  —  Trace the shape",
+        put_text_with_bg(frame, f"{label}  —  move finger to the green START dot",
                          (TX, TY), font_scale=0.55, color=CYAN)
-        put_text_with_bg(frame, "Move index finger to the green START dot.",
-                         (TX, TY + LINE_H), font_scale=0.55, color=WHITE)
 
     elif st.state == TS.POSITIONING:
         pct = int(st.position_progress * 100)
-        put_text_with_bg(frame, f"{label}  —  Hold steady... {pct}%",
+        put_text_with_bg(frame, f"{label}  —  hold steady on START... {pct}%",
                          (TX, TY), font_scale=0.55, color=GREEN)
-        put_text_with_bg(frame, "Keep finger on START dot to begin.",
-                         (TX, TY + LINE_H), font_scale=0.55, color=WHITE)
 
     elif st.state == TS.TRACING:
         rem   = st.time_remaining
         t_col = RED if rem < 2 else YELLOW if rem < 4 else GREEN
-        put_text_with_bg(frame, f"{label}  —  RECORDING",
-                         (TX, TY), font_scale=0.55, color=RED)
-        put_text_with_bg(frame, f"{st.point_count} pts  |  {rem:.1f} s  —  reach END or close fist",
-                         (TX, TY + LINE_H), font_scale=0.55, color=t_col)
+        put_text_with_bg(frame, f"{label}  —  REC  {st.point_count} pts | {rem:.0f}s  (reach END / close fist)",
+                         (TX, TY), font_scale=0.55, color=t_col)
 
     elif st.state == TS.COMPLETED:
         put_text_with_bg(frame, f"{label}  —  Analysing...",
@@ -316,6 +310,27 @@ def _draw_traced_path(frame, traced, w: int, h: int) -> None:
         cv2.line(frame, pts[i - 1], pts[i], (b, g, r), 3, lineType=cv2.LINE_AA)
     cv2.circle(frame, pts[-1], 8, WHITE, -1)
     cv2.circle(frame, pts[-1], 8, CYAN,  2)
+
+
+def _draw_fingertip_spinner(frame, fx: int, fy: int, progress: float) -> None:
+    """Animated loading-spinner ring drawn around the index fingertip while
+    the user holds on the START point (POSITIONING).
+
+    Two opposing arcs rotate with wall-clock time to read as a spinner; a
+    thinner inner arc fills clockwise to show how much of the required hold
+    has elapsed.
+    """
+    r = 28
+    # Faint static guide ring.
+    cv2.circle(frame, (fx, fy), r, (80, 120, 80), 1, lineType=cv2.LINE_AA)
+    # Rotating spinner: two opposing 80° arcs that sweep with time.
+    base = int(time.time() * 240) % 360
+    cv2.ellipse(frame, (fx, fy), (r, r), base,       0, 80, GREEN, 3, lineType=cv2.LINE_AA)
+    cv2.ellipse(frame, (fx, fy), (r, r), base + 180, 0, 80, GREEN, 3, lineType=cv2.LINE_AA)
+    # Inner progress arc (clockwise from the top) for the hold countdown.
+    cv2.ellipse(frame, (fx, fy), (r - 8, r - 8), -90, 0, int(progress * 360),
+                CYAN, 2, lineType=cv2.LINE_AA)
+    cv2.circle(frame, (fx, fy), 3, WHITE, -1)
 
 
 # ── No-hand overlay ──────────────────────────────────────────────────
@@ -395,9 +410,6 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
         cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 200), -1)
         cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
 
-    if lv.is_drawing_cmd and ls == LivenessState.ACTIVE:
-        _draw_air_canvas(frame, lv.drawing_path, w, h)
-
     if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
         st = lv.shape_tracer
         _draw_shape_template(frame, st.template, w, h,
@@ -405,6 +417,11 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
                              position_progress=st.position_progress)
         if st.state in (TracerState.TRACING, TracerState.VERIFIED, TracerState.FAILED):
             _draw_traced_path(frame, st.traced_path, w, h)
+        # Spinner around the fingertip while holding on the START point.
+        if st.state == TracerState.POSITIONING and hands:
+            tip = hands[0].landmarks[8]   # INDEX_TIP
+            _draw_fingertip_spinner(frame, int(tip.x * w), int(tip.y * h),
+                                    st.position_progress)
 
     _draw_verification_bar(frame, lv.verification_pct, y=10)
 
@@ -449,8 +466,6 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
         return
 
     if ls == LivenessState.SUCCESS:
-        if lv.is_drawing_cmd:
-            _draw_air_canvas(frame, lv.drawing_path, w, h)
         put_text_centered(frame, "VERIFIED!", h // 2 - 20,
                           font_scale=1.4, color=GREEN, thickness=3)
         if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
@@ -504,13 +519,6 @@ def draw_liveness_hud(frame, gm: GameManager, hands):
                              font_scale=0.65, color=touch_color)
             draw_progress_bar(frame, lv.touch_frame_progress, y=h - 108,
                               color_full=GREEN, color_fill=YELLOW)
-
-        if lv.is_drawing_cmd:
-            pts = lv.drawing_point_count
-            hint = (f"Drawing... ({pts} pts) - close fist to finish"
-                    if pts > 0 else "Extend index finger and draw")
-            put_text_with_bg(frame, hint, (20, h - 125),
-                             font_scale=0.55, color=MAGENTA)
 
         if lv.is_shape_trace_cmd and lv.shape_tracer is not None:
             _draw_shape_info_panel(frame, lv.shape_tracer, lv.shape_trace_label,
@@ -760,8 +768,8 @@ def draw_shape_eval_hud(frame, gm: GameManager, hands):
                 f"FRR:{stats['frr']*100:.0f}%")
     put_text_with_bg(frame, stat_txt, (220, 30), font_scale=0.55, color=WHITE)
 
-    put_text_centered(frame, f"Shape: {ev.shape_label}",
-                      h // 2 - 55, font_scale=0.8, color=CYAN, thickness=2)
+    put_text_with_bg(frame, f"Shape: {ev.shape_label}",
+                     (12, 66), font_scale=0.6, color=CYAN, thickness=2)
 
     if ev.eval_state == _EvalState.RESULT and ev.latest_log:
         res_col = GREEN if ev.latest_log.result == "VERIFIED" else RED
@@ -783,29 +791,33 @@ def draw_shape_eval_hud(frame, gm: GameManager, hands):
     elif ev.eval_mode == EvalMode.HUMAN_TEST:
         ts = ev.human_tracer_state
         if ts is not None:
+            # Instructions kept short and corner-anchored (top-left, below the
+            # stats bar) so they never cover the centred shape / trace.
+            IX, IY = 12, 92
             if ts == TracerState.INSTRUCTING:
                 rem = ev._tracer.instruct_remaining if ev._tracer else 0.0
-                put_text_centered(frame,
-                                  f"Read instructions...  {rem:.1f}s",
-                                  h // 2 - 20, font_scale=0.65, color=YELLOW)
+                put_text_with_bg(frame, f"Read instructions...  {rem:.0f}s",
+                                 (IX, IY), font_scale=0.55, color=YELLOW)
             elif ts == TracerState.IDLE:
-                put_text_centered(frame, "Move index finger to the START point",
-                                  h // 2 - 20, font_scale=0.65, color=YELLOW)
+                put_text_with_bg(frame, "Move finger to START dot",
+                                 (IX, IY), font_scale=0.55, color=YELLOW)
             elif ts == TracerState.POSITIONING:
                 pct = int(ev.human_position_progress * 100)
-                put_text_centered(frame, f"Hold at START...  {pct}%",
-                                  h // 2 - 20, font_scale=0.65, color=GREEN)
+                put_text_with_bg(frame, f"Hold at START...  {pct}%",
+                                 (IX, IY), font_scale=0.55, color=GREEN)
+                if hands:
+                    tip = hands[0].landmarks[8]   # INDEX_TIP
+                    _draw_fingertip_spinner(frame, int(tip.x * w), int(tip.y * h),
+                                            ev.human_position_progress)
             elif ts == TracerState.TRACING:
                 t_rem = ev.human_time_remaining
                 t_col = RED if t_rem < 2 else YELLOW if t_rem < 4 else WHITE
-                put_text_centered(frame,
-                                  f"Tracing  {ev.human_point_count} pts  |  {t_rem:.1f}s left",
-                                  h // 2 - 20, font_scale=0.7, color=t_col, thickness=2)
-                put_text_centered(frame, "Reach END point or close fist",
-                                  h // 2 + 12, font_scale=0.58, color=ORANGE)
+                put_text_with_bg(frame,
+                                 f"REC  {ev.human_point_count}p  {t_rem:.0f}s",
+                                 (IX, IY), font_scale=0.55, color=t_col)
             elif ts == TracerState.COMPLETED:
-                put_text_centered(frame, "Computing DTW...",
-                                  h // 2 - 20, font_scale=0.8, color=CYAN)
+                put_text_with_bg(frame, "Computing DTW...",
+                                 (IX, IY), font_scale=0.55, color=CYAN)
     else:
         pct = int(ev.attack_animation_progress * 100)
         put_text_centered(frame, f"Simulating attack...  {pct}%",

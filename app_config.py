@@ -131,11 +131,11 @@ class TouchTestConfig:
 @dataclass
 class ShapeTraceConfig:
     """Shape tracing DTW verification and UI timing."""
-    draw_time:      float = 10.0
+    draw_time:      float = 18.0
     dtw_threshold:  float = 0.25
     resample_n:     int   = 50
     min_hand_scale: float = 0.10
-    pos_hold:       float = 0.50
+    pos_hold:       float = 1.50
     instruct_time:  float = 3.0
 
 

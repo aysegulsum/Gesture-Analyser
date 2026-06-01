@@ -127,11 +127,11 @@ touch_test:
 #    4. Accept if normalised cost <= dtw_threshold.
 #
 shape_trace:
-  draw_time:       12.0   # seconds allowed per trace attempt (timer starts at TRACING)
+  draw_time:       18.0   # seconds allowed per trace attempt (timer starts at TRACING)
   dtw_threshold:   0.25   # normalised per-point DTW cost acceptance threshold
   resample_n:      50     # number of points for DTW resampling
   min_hand_scale:  0.05   # minimum hand_scale (depth liveness gate; loosened for Z-axis flexibility)
-  pos_hold:        0.50   # seconds to hold at start point before TRACING begins
+  pos_hold:        1.50   # seconds to hold at start point before TRACING begins
   instruct_time:   3.0    # seconds to display the instruction overlay
 
 

@@ -93,7 +93,7 @@ def run():
                 gm.update(hands)
 
                 # HUD rendering
-                if not gm.hands_present:
+                if not gm.hands_present and not gm.suppress_no_hand_overlay:
                     draw_no_hand_overlay(frame)
                 HUD_DRAWERS[gm.current_mode](frame, gm, hands)
 

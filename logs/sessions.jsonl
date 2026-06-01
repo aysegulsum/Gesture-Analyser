@@ -1,0 +1,3 @@
+{"timestamp": "2026-06-01T20:06:54.353292+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 28.4, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 5}}
+{"timestamp": "2026-06-01T20:07:14.392179+00:00", "mode": "TouchTest", "result": "COMPLETE", "duration_s": 13.75, "metrics": {"passed_count": 5}}
+{"timestamp": "2026-06-01T20:32:55.701527+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 29.02, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 4}}

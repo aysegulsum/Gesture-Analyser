@@ -426,7 +426,7 @@ class LivenessChallenge:
         # momentarily freeze.  Sustained suspicion for block_frames consecutive
         # frames is treated as a definitive spoof attempt and immediately fails
         # the challenge, bypassing all other game logic for this frame.
-        if self.state in (LivenessState.ACTIVE, LivenessState.DEBOUNCE):
+        if cfg.anti_spoof.enabled and self.state in (LivenessState.ACTIVE, LivenessState.DEBOUNCE):
             if self._anti_spoof.analyze().is_suspicious:
                 self._spoof_consecutive += 1
                 if self._spoof_consecutive >= cfg.anti_spoof.block_frames:

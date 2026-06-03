@@ -84,6 +84,7 @@ class TouchConfig:
 @dataclass
 class AntiSpoofConfig:
     """Static-image and frozen-video detection parameters."""
+    enabled:               bool  = True  # master switch for the liveness hard-block gate
     tremor_min_std:        float = 0.0003
     tremor_buffer_size:    int   = 30
     tremor_warmup_frames:  int   = 90

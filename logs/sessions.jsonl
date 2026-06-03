@@ -1,3 +1,15 @@
 {"timestamp": "2026-06-01T20:06:54.353292+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 28.4, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 5}}
 {"timestamp": "2026-06-01T20:07:14.392179+00:00", "mode": "TouchTest", "result": "COMPLETE", "duration_s": 13.75, "metrics": {"passed_count": 5}}
 {"timestamp": "2026-06-01T20:32:55.701527+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 29.02, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 4}}
+{"timestamp": "2026-06-01T20:37:01.564960+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 31.01, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 0}}
+{"timestamp": "2026-06-01T20:37:24.392975+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 20.1, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 0}}
+{"timestamp": "2026-06-02T10:01:16.376508+00:00", "mode": "Math", "result": "GAME_OVER", "duration_s": 60.62, "metrics": {"score": 6}}
+{"timestamp": "2026-06-02T10:10:27.375104+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 33.7, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 0}}
+{"timestamp": "2026-06-02T10:31:17.120322+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 42.71, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 0}}
+{"timestamp": "2026-06-02T10:31:41.344332+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 20.64, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 0}}
+{"timestamp": "2026-06-02T10:37:36.999160+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 82.27, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 0}}
+{"timestamp": "2026-06-02T11:45:46.751657+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 22.33, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 0}}
+{"timestamp": "2026-06-02T12:00:15.545114+00:00", "mode": "TouchTest", "result": "COMPLETE", "duration_s": 25.69, "metrics": {"passed_count": 5}}
+{"timestamp": "2026-06-03T04:53:15.702406+00:00", "mode": "Liveness", "result": "VERIFIED_100", "duration_s": 26.68, "metrics": {"challenges_completed": 5, "score": 100, "spoof_blocks": 0}}
+{"timestamp": "2026-06-03T05:01:33.337748+00:00", "mode": "Sequential", "result": "COMPLETE", "duration_s": 74.99, "metrics": {"passed_count": 19, "total_steps": 19}}
+{"timestamp": "2026-06-03T05:12:58.792795+00:00", "mode": "Sequential", "result": "COMPLETE", "duration_s": 431.44, "metrics": {"passed_count": 16, "total_steps": 19}}

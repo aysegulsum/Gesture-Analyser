@@ -76,6 +76,9 @@ touch:
 #    Static printed images have almost no luminance change over time.
 #
 anti_spoof:
+  enabled:               false   # master switch: false = no spoof blocking in Liveness
+                                 # (challenges judged purely on whether the gesture is
+                                 #  performed correctly; no "SPOOF DETECTED" gate)
   tremor_min_std:        0.0003  # min wrist-position std-dev (below = static spoof)
   tremor_buffer_size:    30      # frames kept for tremor analysis (~1 s at 30 fps)
   tremor_warmup_frames:  90      # startup frames before flagging (~3 s at 30 fps)
